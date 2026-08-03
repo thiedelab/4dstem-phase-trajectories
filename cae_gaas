@@ -1,0 +1,4609 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+# In[1]:
+
+
+import h5py
+import numpy as np
+
+
+# In[2]:
+
+
+h5_path = "aligned_patterns.h5"
+
+patterns_list = []
+xy_list = []
+temp_list = []
+
+with h5py.File(h5_path, "r") as f:
+    temp_keys = sorted([k for k in f.keys() if k.startswith("T")],
+                       key=lambda s: int(s[1:]))  # "T0","T1",...
+
+    for T_key in temp_keys:
+        dp = f[T_key]["patterns"]          # (Ny, Nx, H, W)
+        Ny, Nx = dp.shape[:2]
+        T_idx = int(T_key[1:])             # numeric temp index (or use real temp if stored)
+
+        for y in range(Ny):
+            for x in range(Nx):
+                patterns_list.append(dp[y, x])
+                xy_list.append((y, x))
+                temp_list.append(T_idx)
+
+patterns = np.stack(patterns_list, axis=0).astype(np.float32)  # (N, H, W)
+xy = np.array(xy_list, dtype=np.int32)                         # (N, 2)
+temps = np.array(temp_list, dtype=np.int32)                    # (N,)
+ids = np.arange(len(patterns), dtype=np.int64)                 # global stable ID
+
+
+# In[3]:
+
+
+from scipy.ndimage import shift
+import torch
+from torch.utils.data import Dataset
+
+def mask_central_beam(img, qx0, qy0, radius):
+    H, W = img.shape
+    Y, X = np.ogrid[:H, :W]
+    mask = (X - qx0)**2 + (Y - qy0)**2 <= radius**2
+    out = img.copy()
+    out[mask] = 0
+    return out
+
+def mask_outer_circle(img, cx, cy, radius):
+    H, W = img.shape
+    Y, X = np.ogrid[:H, :W]
+    mask = (X - cx)**2 + (Y - cy)**2 >= radius**2
+    out = img.copy()
+    out[mask] = 0
+    return out
+
+class STEM4DDataset(Dataset):
+    def __init__(
+        self,
+        patterns,
+        xy,
+        temps,
+        ids,
+        probe_qx0,
+        probe_qy0,
+        central_radius=12,
+        outer_radius=None,
+        transform=None,
+    ):
+        self.N, self.H, self.W = patterns.shape
+
+        # broadcast probe centers if scalar
+        if np.isscalar(probe_qx0):
+            probe_qx0 = np.full(self.N, probe_qx0, dtype=np.float32)
+        if np.isscalar(probe_qy0):
+            probe_qy0 = np.full(self.N, probe_qy0, dtype=np.float32)
+
+        self.probe_qx0 = probe_qx0
+        self.probe_qy0 = probe_qy0
+
+        centered_patterns = []
+        for i in range(self.N):
+            img = patterns[i]
+
+            img = mask_central_beam(img, probe_qx0[i], probe_qy0[i], central_radius)
+
+            dx = self.W / 2 - probe_qx0[i]
+            dy = self.H / 2 - probe_qy0[i]
+            img = shift(img, shift=(dy, dx), mode="nearest")
+
+            if outer_radius is not None:
+                img = mask_outer_circle(img, self.W / 2, self.H / 2, outer_radius)
+
+            p99 = np.percentile(img, 99)
+            if p99 > 1e-6:
+                img = img / p99
+            img = np.clip(img, 0, 1)
+
+            centered_patterns.append(img.astype(np.float32))
+
+        self.patterns = np.stack(centered_patterns, axis=0)
+        self.xy = xy.astype(np.int32)
+        self.temps = temps.astype(np.int32)
+        self.ids = ids.astype(np.int64)
+        self.transform = transform
+
+    def __len__(self):
+        return self.N
+
+    def __getitem__(self, idx):
+        img = torch.from_numpy(self.patterns[idx]).unsqueeze(0)  # (1,H,W)
+
+        if self.transform:
+            img = self.transform(img)
+
+        sample = {
+            "pattern": img,
+            "xy": torch.from_numpy(self.xy[idx]),   # (2,)
+            "temp": torch.tensor(self.temps[idx]),
+            "id": torch.tensor(self.ids[idx]),
+        }
+        return sample
+
+
+# In[4]:
+
+
+probe_qx0, probe_qy0 = 131.68677, 119.420616
+dataset = STEM4DDataset(
+    patterns,
+    xy,
+    temps,
+    ids,
+    probe_qx0=probe_qx0,
+    probe_qy0=probe_qy0,
+    central_radius=17,
+    outer_radius=72,
+)
+
+from torch.utils.data import DataLoader
+batch_size = 32
+dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+
+# In[5]:
+
+
+# device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# model = ConvAutoencoder(latent_dim=218).to(device)
+
+# np.random.seed(0)
+# fixed_ids = np.random.choice(len(dataset), size=6, replace=False)
+
+# fixed_batch = torch.stack([dataset[i]["pattern"] for i in fixed_ids]).to(device)
+
+# import matplotlib.pyplot as plt
+
+# def show_reconstructions(model, fixed_batch, epoch):
+#     model.eval()
+#     with torch.no_grad():
+#         recon, _ = model(fixed_batch)
+
+#     fig, axes = plt.subplots(2, 6, figsize=(15, 5))
+
+#     for i in range(6):
+#         axes[0, i].imshow(fixed_batch[i].cpu().squeeze(), cmap="viridis")
+#         axes[0, i].set_title(f"Original {fixed_ids[i]}")
+#         axes[0, i].axis("off")
+
+#         axes[1, i].imshow(recon[i].cpu().squeeze(), cmap="viridis")
+#         axes[1, i].set_title(f"Recon @ epoch {epoch}")
+#         axes[1, i].axis("off")
+
+#     plt.tight_layout()
+#     plt.show()
+
+
+
+# In[6]:
+
+
+import torch.nn as nn
+import torch.optim as optim
+import matplotlib.pyplot as plt
+
+class ConvAutoencoder(nn.Module):
+    def __init__(self, latent_dim=218):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Conv2d(1, 16, 3, 2, 1),
+            nn.ReLU(),
+            nn.Conv2d(16, 32, 3, 2, 1),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, 3, 2, 1),
+            nn.ReLU(),
+            nn.Conv2d(64, 128, 3, 2, 1),
+            nn.ReLU(),
+        )
+        with torch.no_grad():
+            dummy = torch.zeros(1, 1, 256, 256)
+            enc_out = self.encoder(dummy)
+        self.enc_shape = enc_out.shape[1:]
+        self.flatten_dim = enc_out.numel()
+
+        self.fc1 = nn.Linear(self.flatten_dim, latent_dim)
+        self.fc2 = nn.Linear(latent_dim, self.flatten_dim)
+
+        C, H, W = self.enc_shape
+        self.decoder = nn.Sequential(
+            nn.ConvTranspose2d(C, 64, 3, 2, 1, output_padding=1),
+            nn.ReLU(),
+            nn.ConvTranspose2d(64, 32, 3, 2, 1, output_padding=1),
+            nn.ReLU(),
+            nn.ConvTranspose2d(32, 16, 3, 2, 1, output_padding=1),
+            nn.ReLU(),
+            nn.ConvTranspose2d(16, 1, 3, 2, 1, output_padding=1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+        b = x.size(0)
+        x_enc = self.encoder(x)
+        x_flat = x_enc.view(b, -1)
+        z = self.fc1(x_flat)
+        x_flat2 = self.fc2(z)
+        x_unflat = x_flat2.view(b, *self.enc_shape)
+        x_rec = self.decoder(x_unflat)
+        return x_rec, z
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = ConvAutoencoder(latent_dim=218).to(device)
+
+######
+np.random.seed(1)
+fixed_ids = [450, 800, 5000, 12000, 20000, 26000]
+
+fixed_batch = torch.stack([dataset[i]["pattern"] for i in fixed_ids]).to(device)
+
+def show_reconstructions(model, fixed_batch, epoch):
+    model.eval()
+    with torch.no_grad():
+        recon, _ = model(fixed_batch)
+
+    fig, axes = plt.subplots(2, 6, figsize=(15, 5))
+
+    for i in range(6):
+        axes[0, i].imshow(fixed_batch[i].cpu().squeeze(), cmap="viridis")
+        axes[0, i].set_title(f"Original {fixed_ids[i]}")
+        axes[0, i].axis("off")
+
+        axes[1, i].imshow(recon[i].cpu().squeeze(), cmap="viridis")
+        axes[1, i].set_title(f"Recon @ epoch {epoch}")
+        axes[1, i].axis("off")
+
+    plt.tight_layout()
+    plt.show()
+#######
+
+
+# criterion = nn.MSELoss()
+criterion = nn.L1Loss()
+optimizer = optim.Adam(model.parameters(), lr=1e-3)
+scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.5)
+
+num_epochs = 100
+epoch_losses = []
+
+check_epochs = {1, 2, 5, 10, 25, 50, 100}
+
+for epoch in range(1, num_epochs + 1):
+    model.train()
+    running_loss = 0.0
+
+    for batch in dataloader:
+        x = batch["pattern"].to(device)
+        optimizer.zero_grad()
+        x_recon, _ = model(x)
+        loss = criterion(x_recon, x)
+        loss.backward()
+        optimizer.step()
+        running_loss += loss.item() * x.size(0)
+
+    scheduler.step()
+    epoch_loss = running_loss / len(dataset)
+    epoch_losses.append(epoch_loss)
+    print(f"Epoch {epoch}/{num_epochs}, Loss: {epoch_loss:.6f}, LR: {scheduler.get_last_lr()[0]:.3e}")
+
+    if epoch in check_epochs:
+        show_reconstructions(model, fixed_batch, epoch)
+
+
+# In[7]:
+
+
+model.eval()
+all_latents = []
+all_xy = []
+all_temp = []
+all_originals = []
+all_id = []
+
+with torch.no_grad():
+    for batch in dataloader:
+        x = batch["pattern"].to(device)
+        x_rec, z = model(x)
+
+        all_latents.append(z.cpu())
+        all_xy.append(batch["xy"])
+        all_temp.append(batch["temp"])
+        all_originals.append(x.cpu())
+        all_id.append(batch["id"])
+
+all_latents = torch.cat(all_latents, dim=0).numpy()   # (N, latent_dim)
+all_xy = torch.cat(all_xy, dim=0).numpy()             # (N, 2)
+all_temp = torch.cat(all_temp, dim=0).numpy()
+all_originals = torch.cat(all_originals, dim=0).numpy()  # (N,)
+all_id = torch.cat(all_id, dim=0).numpy()             # (N,)
+
+# restore original global order
+sort_idx = np.argsort(all_id)
+latents_sorted = all_latents[sort_idx]
+all_originals_sorted = all_originals[sort_idx]
+xy_sorted = all_xy[sort_idx]
+temps_sorted = all_temp[sort_idx]
+ids_sorted = all_id[sort_idx]
+
+
+# In[8]:
+
+
+np.savez(
+    "latents_xy_temp_l1_epoch100.npz",
+    latents=latents_sorted,
+    xy=xy_sorted,
+    temps=temps_sorted,
+    ids=ids_sorted,
+    originals = all_originals_sorted,
+)
+
+
+# In[1]:
+
+
+import numpy as np
+data = np.load("latents_xy_temp_l1_epoch100.npz")
+
+
+# In[2]:
+
+
+latents_sorted = data["latents"]
+xy_sorted = data["xy"]
+all_originals_sorted = data["originals"]
+temps_sorted = data["temps"]
+ids_sorted = data["ids"]
+
+
+# In[3]:
+
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+# choose the pixel you want
+x0, y0 = 12, 45   # example
+
+# mask for that spatial coordinate
+mask = (xy_sorted[:,0] == y0) & (xy_sorted[:,1] == x0)
+
+# extract the corresponding temperatures and patterns
+temps_xy = temps_sorted[mask]
+patterns_xy = all_originals_sorted[mask]
+
+# sort by temperature
+order = np.argsort(temps_xy)
+temps_xy = temps_xy[order]
+patterns_xy = patterns_xy[order]
+
+
+# In[4]:
+
+
+n = len(patterns_xy)
+cols = 8
+rows = int(np.ceil(n / cols))
+
+plt.figure(figsize=(2*cols, 2*rows))
+
+for i, (T, pat) in enumerate(zip(temps_xy, patterns_xy)):
+    plt.subplot(rows, cols, i+1)
+    plt.imshow(pat[0], cmap='inferno')
+    plt.title(f"T = {T}")
+    plt.axis('off')
+
+plt.tight_layout()
+plt.show()
+
+
+# In[49]:
+
+
+# ###workflow 1
+
+from sklearn.model_selection import train_test_split
+
+N = len(latents_sorted)
+indices = np.arange(N)
+
+train_idx, test_idx = train_test_split(
+    indices, test_size=0.1, random_state=0, shuffle=True
+)
+
+latents_train = latents_sorted[train_idx]
+latents_test  = latents_sorted[test_idx]
+
+patterns_train = all_originals_sorted[train_idx]
+patterns_test  = all_originals_sorted[test_idx]
+
+xy_train = xy_sorted[train_idx]
+xy_test  = xy_sorted[test_idx]
+
+temps_train = temps_sorted[train_idx]
+temps_test  = temps_sorted[test_idx]
+
+ids_train = ids_sorted[train_idx]
+ids_test  = ids_sorted[test_idx]
+
+
+from sklearn.decomposition import PCA
+from sklearn.cluster import KMeans
+
+pca = PCA(n_components=64)
+latents_train_pca = pca.fit_transform(latents_train)
+latents_test_pca  = pca.transform(latents_test)
+
+kmeans = KMeans(n_clusters=50, random_state=0)
+cluster_train = kmeans.fit_predict(latents_train)
+cluster_test  = kmeans.predict(latents_test)
+
+
+# In[7]:
+
+
+from sklearn.decomposition import PCA
+from sklearn.cluster import KMeans
+pca = PCA(n_components=64)
+latents_all_pca = pca.fit_transform(latents_sorted)
+
+kmeans = KMeans(n_clusters=50, random_state=0)
+cluster_labels= kmeans.fit_predict(latents_sorted)
+
+
+# In[9]:
+
+
+import matplotlib.pyplot as plt
+import numpy as np
+
+plt.figure(figsize=(8,6))
+
+# Raining points
+import matplotlib.colors as mcolors
+
+cmap = plt.cm.get_cmap("viridis", 50)  # discrete colors
+plt.scatter(
+    latents_all_pca[:,0],
+    latents_all_pca[:,1],
+    c=cluster_labels,
+    cmap=cmap,
+    s=8
+)
+
+# # Raining points
+# import matplotlib.colors as mcolors
+
+# cmap = plt.cm.get_cmap("viridis", 50)  # discrete colors
+# plt.scatter(
+#     latents_train_pca[:,0],
+#     latents_train_pca[:,1],
+#     c=cluster_train,
+#     cmap=cmap,
+#     s=8
+# )
+
+
+# # Test points
+# plt.scatter(
+#     latents_test_pca[:,0],
+#     latents_test_pca[:,1],
+#     c=cluster_test,
+#     cmap="tab20",
+#     s=12,
+#     marker="x",
+#     alpha=0.9,
+#     label="test"
+# )
+
+plt.title("PCA Projection Colored by KMeans Clusters")
+plt.xlabel("PC1")
+plt.ylabel("PC2")
+plt.colorbar()
+#plt.legend()
+plt.tight_layout()
+plt.show()
+
+
+# In[11]:
+
+
+# import matplotlib.pyplot as plt
+# rng = np.random.default_rng(0)
+
+# for k in np.unique(cluster_train):
+#     idx = np.where(cluster_train == k)[0]
+#     sel = rng.choice(idx, size=min(8, len(idx)), replace=False)
+
+#     fig, axes = plt.subplots(1, len(sel), figsize=(3*len(sel), 3))
+#     for ax, i in zip(axes, sel):
+#         ax.imshow(patterns_train[i].squeeze(), cmap="inferno")
+#         ax.axis("off")
+#     plt.suptitle(f"Cluster {k}")
+#     plt.show()
+
+import matplotlib.pyplot as plt
+rng = np.random.default_rng(0)
+
+for k in np.unique(cluster_labels):
+    idx = np.where(cluster_labels == k)[0]
+    sel = rng.choice(idx, size=min(8, len(idx)), replace=False)
+
+    fig, axes = plt.subplots(1, len(sel), figsize=(3*len(sel), 3))
+    for ax, i in zip(axes, sel):
+        ax.imshow(all_originals_sorted[i].squeeze(), cmap="inferno")
+        ax.axis("off")
+    plt.suptitle(f"Cluster {k}")
+    plt.show()
+
+
+
+# In[12]:
+
+
+## all patterns (100%)
+cluster_to_phase = {
+    0: "A",
+    1: "C",
+    2: "R",
+    3: "A",
+    4: "R",
+    5: "C",
+    6: "A",
+    7: "R",
+    8: "T",
+    9: "T/P",
+    10: "C",
+    11: "C",
+    12: "A",
+    13: "R",
+    14: "R/T",
+    15: "T",
+    16: "C",
+    17: "C",
+    18: "A",
+    19: "P",
+    20: "R",
+    21: "T",
+    22: "T",
+    23: "P",
+    24: "P",
+    25: "C/T",
+    26: "R",
+    27: "C",
+    28: "A",
+    29: "A",
+    30: "P",
+    31: "P",
+    32: "R",
+    33: "T",
+    34: "C/T",
+    35: "C",
+    36: "P",
+    37: "C/P",
+    38: "C",
+    39: "A",
+    40: "A/C",
+    41: "P",
+    42: "T",
+    43: "C/T",
+    44: "C/T",
+    45: "P",
+    46: "C",
+    47: "A/C",
+    48: "A",
+    49: "C",
+}
+
+
+# ### train test split
+# cluster_to_phase = {
+#     0: "C",
+#     1: "A",
+#     2: "C",
+#     3: "R",
+#     4: "A",
+#     5: "C/T",
+#     6: "C",
+#     7: "R",
+#     8: "C/T",
+#     9: "T",
+#     10: "R",
+#     11: "C",
+#     12: "A",
+#     13: "A/C",
+#     14: "T",
+#     15: "C",
+#     16: "T",
+#     17: "R",
+#     18: "C",
+#     19: "P",
+#     20: "T",
+#     21: "T",
+#     22: "A",
+#     23: "A/C",
+#     24: "T",
+#     25: "R",
+#     26: "A",
+#     27: "C",
+#     28: "R",
+#     29: "A",
+#     30: "P",
+#     31: "P",
+#     32: "T",
+#     33: "P",
+#     34: "T",
+#     35: "C",
+#     36: "P",
+#     37: "A",
+#     38: "R",
+#     39: "P",
+#     40: "C",
+#     41: "A",
+#     42: "R",
+#     43: "C/P",
+#     44: "C/T",
+#     45: "C",
+#     46: "P",
+#     47: "T/P",
+#     48: "C/T",
+#     49: "A",
+# }
+
+
+
+
+# In[13]:
+
+
+# cluster_to_phase = {
+#     0: "Mixed",
+#     1: "A",
+#     2: "R",
+#     3: "R",
+#     4: "C",
+#     5: "R",
+#     6: "Mixed",
+#     7: "T",
+#     8: "A",
+#     9: "C",
+#     10: "T",
+#     11: "T",
+#     12: "C",
+#     13: "R",
+#     14: "A",
+#     15: "T",
+#     16: "R",
+#     17: "T",
+#     18: "T",
+#     19: "A",
+#     20: "C",
+#     21: "C",
+#     22: "R",
+#     23: "A",
+#     24: "R",
+#     25: "C",
+#     26: "A",
+#     27: "A",
+#     28: "P",
+#     29: "P",
+#     30: "P",
+#     31: "P",
+#     32: "R",
+#     33: "T",
+#     34: "T",
+# }
+
+
+# In[14]:
+
+
+# print("Clusters in mapping:", sorted(cluster_to_phase.keys()))
+# missing = [c for c in np.unique(cluster_train) if c not in cluster_to_phase]
+# print("Missing clusters:", missing)
+
+
+# In[189]:
+
+
+# phase_train = np.array([cluster_to_phase[c] for c in cluster_train])
+# phase_test  = np.array([cluster_to_phase[c] for c in cluster_test])
+
+# # unique_phases = sorted(set(phase_train)) ### use for non-mapping
+# unique_phases = sorted(set(phase_train) | set(phase_test))
+
+# phase_to_id = {p: i for i, p in enumerate(unique_phases)}
+
+# phase_id_train = np.array([phase_to_id[p] for p in phase_train])
+# phase_id_test  = np.array([phase_to_id[p] for p in phase_test])
+
+phase_all = np.array([cluster_to_phase[c] for c in cluster_labels])
+
+unique_phases = sorted(set(phase_all)) ### use for non-mapping
+
+phase_to_id = {p: i for i, p in enumerate(unique_phases)}
+
+phase_id_all = np.array([phase_to_id[p] for p in phase_all])
+
+
+# In[196]:
+
+
+from collections import defaultdict
+
+# Grid size
+Ny, Nx = 70, 57
+num_pixels = Ny * Nx
+
+# Unique temperature steps
+T_unique = np.sort(np.unique(temps_sorted))
+num_temps = len(T_unique)
+
+# Initialize trajectory dictionary
+traj_raw = defaultdict(list)
+
+# Reconstruct trajectories by slicing blocks of size num_pixels
+for ti, T in enumerate(T_unique):
+    start = ti * num_pixels
+    end   = (ti + 1) * num_pixels
+
+    phases_T = phase_all[start:end]
+
+    for pix in range(num_pixels):
+        traj_raw[pix].append((T, phases_T[pix]))
+
+
+# In[199]:
+
+
+hybrid_labels = {"A/C", "C/T", "C/P", "T/P", "A/T", "A/P", "R/T"}
+
+def collapse_phase(p):
+    if p in hybrid_labels:
+        return "H"
+    if p in {"C", "R"}:
+        return "C*"
+    return p
+
+traj = {}
+
+for pix, seq in traj_raw.items():
+    new_seq = []
+    for (T, p) in seq:
+        new_seq.append((T, collapse_phase(p)))
+    traj[pix] = new_seq
+
+labels_msm = ["A", "C*", "H", "P", "T"]
+phase_to_id_msm = {p: i for i, p in enumerate(labels_msm)}
+
+C_low,  P_low  = compute_transition_matrix_MSM(traj, 0, 4, phase_to_id_msm)
+C_high, P_high = compute_transition_matrix_MSM(traj, 5, 7, phase_to_id_msm)
+
+
+print("LOW TEMPERATURE (0–4)")
+print_transition_table(P_low, labels_msm)
+
+print("\nHIGH TEMPERATURE (5–7)")
+print_transition_table(P_high, labels_msm)
+
+
+# In[198]:
+
+
+hybrid_labels = {"A/C", "C/T", "C/P", "T/P", "A/T", "A/P", "R/T"}
+
+def collapse_phase(p):
+    if p in hybrid_labels:
+        return "H"
+    # if p in {"C", "R"}:
+    #     return "C*"
+    return p
+
+traj = {}
+
+for pix, seq in traj_raw.items():
+    new_seq = []
+    for (T, p) in seq:
+        new_seq.append((T, collapse_phase(p)))
+    traj[pix] = new_seq
+
+labels_msm = ["A", "C", "H", "P", "R", "T"]
+phase_to_id_msm = {p: i for i, p in enumerate(labels_msm)}
+
+C_low,  P_low  = compute_transition_matrix_MSM(traj, 0, 4, phase_to_id_msm)
+C_high, P_high = compute_transition_matrix_MSM(traj, 5, 7, phase_to_id_msm)
+
+
+print("LOW TEMPERATURE (0–4)")
+print_transition_table(P_low, labels_msm)
+
+print("\nHIGH TEMPERATURE (5–7)")
+print_transition_table(P_high, labels_msm)
+
+
+# In[194]:
+
+
+# mask_T = (temps_sorted == 0)
+
+# # Extract the phase labels for those pixels
+# phase_labels_T = phase_all[mask_T]
+
+# phase_labels_T_list = phase_labels_T.tolist()
+# # print(phase_labels_T_list)
+# print(phase_all_plot[temps_sorted == 0])
+
+
+
+# In[170]:
+
+
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap
+
+phase_all_plot = []
+for p in phase_all:
+    if "/" in p:
+        phase_all_plot.append("H")
+    elif p in {"C", "R"}:
+        phase_all_plot.append("C*")
+    else:
+        phase_all_plot.append(p)
+phase_all_plot = np.array(phase_all_plot)
+
+labels_plot = ["A", "C*", "H", "P", "T"]
+
+color_for_label = {
+    "A":  "#51127C",  # deep purple
+    "C*": "#8336B3",  # violet
+    "H":  "#B857A6",  # magenta-rose
+    "P":  "#E67E63",  # warm peach
+    "T":  "#F6B13C",  # soft orange-gold
+}
+
+colors = [color_for_label[l] for l in labels_plot]
+cmap = ListedColormap(colors)
+
+phase_to_id_plot = {p: i for i, p in enumerate(labels_plot)}
+phase_id_all_plot = np.array([phase_to_id_plot[p] for p in phase_all_plot])
+
+Ny_true, Nx_true = 70, 57
+T_unique = np.sort(np.unique(temps_sorted))
+
+for T in T_unique:
+    mask = (temps_sorted == T)
+    phase_ids_T = phase_id_all_plot[mask]
+
+    phase_map = phase_ids_T.reshape(Ny_true, Nx_true)
+
+    plt.figure(figsize=(6,6))
+    plt.imshow(phase_map, cmap=cmap, interpolation='nearest', vmin=0, vmax=len(labels_plot)-1)
+    plt.title(f"Collapsed Phase Map at Temperature Step {T}")
+    plt.axis('off')
+
+    # Legend using the same explicit colors
+    handles = [plt.Rectangle((0,0),1,1, color=color_for_label[l]) for l in labels_plot]
+    plt.legend(handles, labels_plot, bbox_to_anchor=(1.05,1), loc='upper left')
+
+    plt.show()
+
+
+# In[173]:
+
+
+# --- 1. Define hybrid labels ---
+hybrid_labels = {"A/C", "C/T", "C/P", "T/P", "A/T", "A/P", "R/T"}
+
+# --- 2. Collapse hybrids directly from phase_all ---
+phase_all_collapsed = np.array([
+    "H" if p in hybrid_labels else p
+    for p in phase_all
+])
+
+# --- 3. Recompute unique phases AFTER collapsing ---
+unique_phases_collapsed = sorted(set(phase_all_collapsed))
+
+# Map phase → ID
+phase_to_id_collapsed = {p: i for i, p in enumerate(unique_phases_collapsed)}
+
+# Convert collapsed labels to IDs
+phase_id_all_collapsed = np.array([phase_to_id_collapsed[p] for p in phase_all_collapsed])
+
+# --- 4. Build table using temps_sorted and phase_id_all_collapsed ---
+T_unique_all = np.sort(np.unique(temps_sorted))
+n_temps = len(T_unique_all)
+n_phases = len(unique_phases_collapsed)
+
+phase_counts = np.zeros((n_phases, n_temps), dtype=int)
+temp_to_idx = {T: i for i, T in enumerate(T_unique_all)}
+
+for i in range(len(phase_id_all_collapsed)):
+    T = temps_sorted[i]
+    t_idx = temp_to_idx[T]
+    p_idx = phase_id_all_collapsed[i]
+    phase_counts[p_idx, t_idx] += 1
+
+# --- 5. Print table ---
+col_width = 12
+header = "Temp".ljust(col_width) + "".join(p.ljust(col_width) for p in unique_phases_collapsed)
+print(header)
+print("-" * len(header))
+
+for ti, T in enumerate(T_unique_all):
+    row = str(T).ljust(col_width)
+    for p in range(n_phases):
+        row += str(phase_counts[p, ti]).ljust(col_width)
+    print(row)
+
+
+# In[125]:
+
+
+# --- Compute fractions by normalizing each temperature column ---
+phase_fractions = phase_counts / phase_counts.sum(axis=0, keepdims=True)
+
+print("\nPhase Fractions by Temperature\n")
+header = "Temp".ljust(col_width) + "".join(p.ljust(col_width) for p in unique_phases_collapsed)
+print(header)
+print("-" * len(header))
+
+for ti, T in enumerate(T_unique_all):
+    row = str(T).ljust(col_width)
+    for p in range(n_phases):
+        row += f"{phase_fractions[p, ti]:.3f}".ljust(col_width)
+    print(row)
+
+
+# In[ ]:
+
+
+
+
+
+# In[172]:
+
+
+# for T in range(0, 8):
+#     C_T, P_T = compute_transition_matrix_collapsed(
+#         traj, Tmin=T, Tmax=T,
+#         phase_to_id=phase_to_id_collapsed,
+#         hybrid_labels=hybrid_labels
+#     )
+#     print(f"T = {T}")
+#     print_transition_table(P_T, unique_phases_collapsed)
+
+
+# In[139]:
+
+
+# import numpy as np
+# from collections import defaultdict
+
+# # --- 1. Build trajectories grouped by pixel ---
+# traj = defaultdict(list)
+# for pid, (y, x, T) in enumerate(zip(xy_train[:,0], xy_train[:,1], temps_train)):
+#     traj[(y, x)].append((T, phase_id_train[pid]))
+
+# # sort each trajectory by temperature
+# for key in traj:
+#     traj[key] = sorted(traj[key], key=lambda x: x[0])
+
+# # --- 2. Count transitions ---
+# nP = len(unique_phases)
+# C_phase = np.zeros((nP, nP), dtype=int)
+
+# for key, seq in traj.items():
+#     for (_, p1), (_, p2) in zip(seq[:-1], seq[1:]):
+#         C_phase[p1, p2] += 1
+
+# # --- 3. Normalize rows to get transition probabilities ---
+# row_sums = C_phase.sum(axis=1, keepdims=True)
+# P_phase = C_phase / np.maximum(row_sums, 1)
+
+# # --- 4. Extract low-T and high-T subsets ---
+# lowT_mask  = temps_train <= 200
+# highT_mask = temps_train >= 250
+
+# # build separate trajectories for low-T and high-T
+# def build_transition_matrix(mask):
+#     traj_sub = defaultdict(list)
+#     for pid, (y, x, T) in enumerate(zip(xy_train[:,0], xy_train[:,1], temps_train)):
+#         if mask[pid]:
+#             traj_sub[(y, x)].append((T, phase_id_train[pid]))
+#     for key in traj_sub:
+#         traj_sub[key] = sorted(traj_sub[key], key=lambda x: x[0])
+
+#     C = np.zeros((nP, nP), dtype=int)
+#     for key, seq in traj_sub.items():
+#         for (_, p1), (_, p2) in zip(seq[:-1], seq[1:]):
+#             C[p1, p2] += 1
+#     R = C.sum(axis=1, keepdims=True)
+#     P = C / np.maximum(R, 1)
+#     return C, P
+
+# C_low,  P_low  = build_transition_matrix(lowT_mask)
+# C_high, P_high = build_transition_matrix(highT_mask)
+
+# # --- 5. Print matrices with phase labels ---
+# phase_order = unique_phases  # e.g., ['A','C','H','P','R','T']
+
+# print("Phase order:", phase_order)
+# print("Low-T transition matrix:\n", P_low)
+# print("High-T transition matrix:\n", P_high)
+
+
+# ## Hybrid states
+
+# In[133]:
+
+
+# hybrid_clusters = [c for c, p in cluster_to_phase.items() if "/" in p]
+# print("Hybrid clusters:", hybrid_clusters)
+
+
+# hybrid_idx = np.where(np.isin(cluster_train, hybrid_clusters))[0]
+# lookup_idx = {}
+# for i in range(len(phase_train)):
+#     y, x = xy_train[i]
+#     T = temps_train[i]
+#     lookup_idx[(y, x, T)] = i
+
+# from collections import defaultdict
+
+# groups = defaultdict(list)
+
+# for i in hybrid_idx:
+#     y, x = xy_train[i]
+#     T = temps_train[i]
+
+#     # skip
+#     if (y, x, T+1) not in lookup_idx:
+#         continue
+
+#     j = lookup_idx[(y, x, T+1)]   # index at next temperature
+#     next_phase = phase_train[j]   # phase at T+1
+
+#     groups[next_phase].append((i, j))   # store pair
+
+
+# In[19]:
+
+
+hybrid_clusters = [c for c, p in cluster_to_phase.items() if "/" in p]
+print("Hybrid clusters:", hybrid_clusters)
+
+
+hybrid_idx = np.where(np.isin(cluster_labels, hybrid_clusters))[0]
+lookup_idx = {}
+for i in range(len(phase_all)):
+    y, x = xy_sorted[i]
+    T = temps_sorted[i]
+    lookup_idx[(y, x, T)] = i
+
+from collections import defaultdict
+
+groups = defaultdict(list)
+
+for i in hybrid_idx:
+    y, x = xy_sorted[i]
+    T = temps_sorted[i]
+
+    # skip
+    if (y, x, T+1) not in lookup_idx:
+        continue
+
+    j = lookup_idx[(y, x, T+1)]   # index at next temperature
+    next_phase = phase_all[j]   # phase at T+1
+
+    groups[next_phase].append((i, j))   # store pair
+
+
+# In[20]:
+
+
+import numpy as np
+import matplotlib.pyplot as plt
+from collections import defaultdict
+
+# Collect temperatures for each hybrid cluster
+temps_by_hybrid = defaultdict(list)
+
+for i in hybrid_idx:
+    c = cluster_labels[i]      
+    T = temps_sorted[i]       
+    temps_by_hybrid[c].append(T)
+
+# Stats
+for c in hybrid_clusters:
+    Ts = temps_by_hybrid[c]
+    if len(Ts) == 0:
+        print(f"Cluster {c} ({cluster_to_phase[c]}): no data")
+        continue
+    print(f"Cluster {c} ({cluster_to_phase[c]}): "
+          f"count={len(Ts)}, min={min(Ts)}, max={max(Ts)}, mean={np.mean(Ts):.2f}")
+
+for c in hybrid_clusters:
+    Ts = temps_by_hybrid[c]
+    if len(Ts) == 0:
+        continue
+
+    plt.figure(figsize=(5,3))
+    plt.hist(Ts, bins=20, color="purple", alpha=0.7)
+    plt.title(f"Temperature distribution for hybrid cluster {c} ({cluster_to_phase[c]})")
+    plt.xlabel("Temperature (T)")
+    plt.ylabel("Count")
+    plt.tight_layout()
+    plt.show()
+
+
+# In[21]:
+
+
+# import numpy as np
+# import matplotlib.pyplot as plt
+# from collections import defaultdict
+
+# # Collect temperatures for each hybrid cluster
+# temps_by_hybrid = defaultdict(list)
+
+# for i in hybrid_idx:
+#     c = cluster_train[i]      
+#     T = temps_train[i]       
+#     temps_by_hybrid[c].append(T)
+
+# # Stats
+# for c in hybrid_clusters:
+#     Ts = temps_by_hybrid[c]
+#     if len(Ts) == 0:
+#         print(f"Cluster {c} ({cluster_to_phase[c]}): no data")
+#         continue
+#     print(f"Cluster {c} ({cluster_to_phase[c]}): "
+#           f"count={len(Ts)}, min={min(Ts)}, max={max(Ts)}, mean={np.mean(Ts):.2f}")
+
+# for c in hybrid_clusters:
+#     Ts = temps_by_hybrid[c]
+#     if len(Ts) == 0:
+#         continue
+
+#     plt.figure(figsize=(5,3))
+#     plt.hist(Ts, bins=20, color="purple", alpha=0.7)
+#     plt.title(f"Temperature distribution for hybrid cluster {c} ({cluster_to_phase[c]})")
+#     plt.xlabel("Temperature (T)")
+#     plt.ylabel("Count")
+#     plt.tight_layout()
+#     plt.show()
+
+
+# In[142]:
+
+
+import matplotlib.pyplot as plt
+import numpy as np
+
+def show_pairs(pairs, title, n=10):
+    if len(pairs) == 0:
+        print(f"No examples for {title}")
+        return
+
+    sel = np.random.choice(len(pairs), size=min(n, len(pairs)), replace=False)
+
+    rows = len(sel)
+    cols = 2
+
+    plt.figure(figsize=(6, 3*rows))
+
+    for k, pair_idx in enumerate(sel):
+        i, j = pairs[pair_idx]
+
+        # pattern at T
+        plt.subplot(rows, cols, 2*k + 1)
+        plt.imshow(patterns_train[i].squeeze(), cmap="inferno")
+        y, x = xy_train[i]
+        T = temps_train[i]
+        phase_i = phase_train[i]
+        plt.title(f"T={T}, {phase_i}")
+        plt.axis("off")
+
+        # pattern at T+1
+        plt.subplot(rows, cols, 2*k + 2)
+        plt.imshow(patterns_train[j].squeeze(), cmap="inferno")
+        T2 = temps_train[j]
+        phase_j = phase_train[j]
+        plt.title(f"T={T2}, → {phase_j}")
+        plt.axis("off")
+
+    plt.suptitle(title, fontsize=16)
+    plt.tight_layout()
+    plt.show()
+
+
+# In[143]:
+
+
+# for dest_phase, pair_list in groups.items():
+#     print(f"\n=== Hybrid → {dest_phase} ===")
+#     show_pairs(pair_list, f"Hybrid → {dest_phase}")
+
+
+# In[144]:
+
+
+from collections import defaultdict
+
+# Identify hybrid clusters (those with a slash)
+hybrid_clusters = [c for c, p in cluster_to_phase.items() if "/" in p]
+print("Hybrid clusters:", hybrid_clusters)
+
+# Build lookup: (y, x, T) -> index in train set
+lookup_idx = {}
+for i in range(len(phase_train)):
+    y, x = xy_train[i]
+    T = temps_train[i]
+    lookup_idx[(y, x, T)] = i
+
+
+# In[22]:
+
+
+from collections import defaultdict
+import numpy as np
+
+# Collect next-phase counts
+hybrid_next_phase_counts = {h: defaultdict(int) for h in hybrid_clusters}
+
+for i in range(len(cluster_labels)):
+    c = cluster_labels[i]
+    if c not in hybrid_clusters:
+        continue
+
+    y, x = xy_sorted[i]
+    T = temps_sorted[i]
+
+    # skip last temperature step
+    if (y, x, T+1) not in lookup_idx:
+        continue
+
+    j = lookup_idx[(y, x, T+1)]
+    next_phase = phase_all[j]
+    hybrid_next_phase_counts[c][next_phase] += 1
+
+# PRINT NUMERIC VALUES
+print("\n=== Hybrid cluster transition probabilities ===\n")
+for h in hybrid_clusters:
+    counts = hybrid_next_phase_counts[h]
+    if not counts:
+        print(f"Cluster {h} ({cluster_to_phase[h]}): NO TRANSITIONS\n")
+        continue
+
+    # sort phases alphabetically for consistency
+    phases = sorted(counts.keys())
+    vals = np.array([counts[p] for p in phases], dtype=float)
+    probs = vals / vals.sum()
+
+    print(f"Cluster {h} ({cluster_to_phase[h]}):")
+    print("  Raw counts:")
+    for p, v in zip(phases, vals):
+        print(f"    {p:>4} : {int(v)}")
+
+    print("  Probabilities:")
+    for p, pr in zip(phases, probs):
+        print(f"    {p:>4} : {pr:.3f}")
+
+    print()  # blank line between clusters
+
+
+# In[24]:
+
+
+## Metastable pathway maps from hybrid clusters
+
+# For each hybrid cluster, collect next-phase labels
+hybrid_next_phase_counts = {h: defaultdict(int) for h in hybrid_clusters}
+
+for i in range(len(cluster_labels)):
+    c = cluster_labels[i]
+    if c not in hybrid_clusters:
+        continue
+
+    y, x = xy_sorted[i]
+    T = temps_sorted[i]
+
+    # skip last temperature step
+    if (y, x, T+1) not in lookup_idx:
+        continue
+
+    j = lookup_idx[(y, x, T+1)]
+    next_phase = phase_all[j]
+    hybrid_next_phase_counts[c][next_phase] += 1
+
+# Plot bar charts per hybrid cluster
+for h in hybrid_clusters:
+    counts = hybrid_next_phase_counts[h]
+    if not counts:
+        print(f"No transitions found for hybrid cluster {h}")
+        continue
+
+    phases = list(counts.keys())
+    vals = np.array([counts[p] for p in phases], dtype=float)
+    probs = vals / vals.sum()
+
+    plt.figure(figsize=(5,3))
+    plt.bar(phases, probs)
+    plt.ylabel("P(next phase | cluster = {})".format(h))
+    plt.title(f"Pathway map for hybrid cluster {h} ({cluster_to_phase[h]})")
+    plt.xticks(rotation=0)
+    plt.tight_layout()
+    plt.show()
+
+
+# In[25]:
+
+
+# ### Stability of hybrid states
+
+# # Define which phase labels count as "hybrid" (contain '/')
+# def is_hybrid_phase(p):
+#     return "/" in p
+
+# dwell_times = defaultdict(list)
+
+# # Group by pixel
+# traj_by_pixel = defaultdict(list)
+# for i in range(len(phase_train)):
+#     y, x = xy_train[i]
+#     T = temps_train[i]
+#     traj_by_pixel[(y, x)].append((T, phase_train[i]))
+
+# # Sort each trajectory by T
+# for key in traj_by_pixel:
+#     traj_by_pixel[key] = sorted(traj_by_pixel[key], key=lambda x: x[0])
+
+# # Scan trajectories and accumulate dwell times
+# for key, seq in traj_by_pixel.items():
+#     if not seq:
+#         continue
+
+#     current_phase = seq[0][1]
+#     length = 1
+
+#     for (T_prev, p_prev), (T_curr, p_curr) in zip(seq[:-1], seq[1:]):
+#         if p_curr == current_phase:
+#             length += 1
+#         else:
+#             dwell_times[current_phase].append(length)
+#             current_phase = p_curr
+#             length = 1
+
+#     dwell_times[current_phase].append(length)
+
+# # =dwell time distributions for a few phases
+# phases_to_show = ["A", "C", "T", "P", "R"] + \
+#                  sorted({p for p in dwell_times.keys() if is_hybrid_phase(p)})
+
+# for p in phases_to_show:
+#     if p not in dwell_times:
+#         continue
+#     times = dwell_times[p]
+#     plt.figure(figsize=(4,3))
+#     plt.hist(times, bins=np.arange(1, max(times)+2)-0.5, density=True)
+#     plt.xlabel("Dwell time (steps)")
+#     plt.ylabel("Probability")
+#     plt.title(f"Dwell time distribution for phase {p}")
+#     plt.tight_layout()
+#     plt.show()
+
+
+# In[27]:
+
+
+## Directional flux through hybrid states
+
+unique_phases = sorted(set(phase_all) | set(phase_all))
+phase_to_id = {p: i for i, p in enumerate(unique_phases)}
+phase_id_all = np.array([phase_to_id[p] for p in phase_all])
+
+nP = len(unique_phases)
+C_phase = np.zeros((nP, nP), dtype=int)
+
+# counts in phase space
+traj_phase = defaultdict(list)
+for i in range(len(phase_id_all)):
+    y, x = xy_sorted[i]
+    T = temps_sorted[i]
+    pid = phase_id_all[i]
+    traj_phase[(y, x)].append((T, pid))
+
+for key in traj_phase:
+    traj_phase[key] = sorted(traj_phase[key], key=lambda x: x[0])
+
+for key, seq in traj_phase.items():
+    for (_, p1), (_, p2) in zip(seq[:-1], seq[1:]):
+        C_phase[p1, p2] += 1
+
+row_sums = np.maximum(C_phase.sum(axis=1, keepdims=True), 1)
+P_phase = C_phase / row_sums
+
+# stationary distribution as normalized visit counts
+visit_counts = C_phase.sum(axis=1) + C_phase.sum(axis=0)
+pi_phase = visit_counts / visit_counts.sum()
+
+# Compute net flux J_{i->j}
+J = np.zeros_like(P_phase, dtype=float)
+for i in range(nP):
+    for j in range(nP):
+        J[i, j] = pi_phase[i] * P_phase[i, j] - pi_phase[j] * P_phase[j, i]
+
+# Focus on fluxes involving hybrid phases?
+hybrid_phases = [p for p in unique_phases if "/" in p]
+print("Hybrid phases:", hybrid_phases)
+
+for h in hybrid_phases:
+    i = phase_to_id[h]
+    print(f"\nNet flux involving hybrid phase {h}:")
+    for j, p_j in enumerate(unique_phases):
+        if i == j:
+            continue
+        if abs(J[i, j]) < 1e-4:
+            continue
+        direction = "→" if J[i, j] > 0 else "←"
+        print(f"{h} {direction} {p_j}: J = {J[i, j]:.4f}")
+
+
+# In[29]:
+
+
+## fate maps in PCA/latent space
+
+hybrid_points = []
+hybrid_next_phases = []
+
+for i in range(len(cluster_labels)):
+    c = cluster_labels[i]
+    if c not in hybrid_clusters:
+        continue
+
+    y, x = xy_sorted[i]
+    T = temps_sorted[i]
+
+    if (y, x, T+1) not in lookup_idx:
+        continue
+
+    j = lookup_idx[(y, x, T+1)]
+    next_phase = phase_all[j]
+
+    hybrid_points.append(latents_all_pca[i])
+    hybrid_next_phases.append(next_phase)
+
+hybrid_points = np.array(hybrid_points)
+hybrid_next_phases = np.array(hybrid_next_phases)
+
+# 2D fate map using first two PCA components
+phases_unique = sorted(set(hybrid_next_phases))
+colors = plt.cm.tab10(np.linspace(0, 1, len(phases_unique)))
+phase_to_color = {p: colors[k] for k, p in enumerate(phases_unique)}
+
+plt.figure(figsize=(6,5))
+for p in phases_unique:
+    mask = (hybrid_next_phases == p)
+    plt.scatter(hybrid_points[mask, 0],
+                hybrid_points[mask, 1],
+                s=10, alpha=0.6, color=phase_to_color[p], label=p)
+
+plt.xlabel("PCA 1")
+plt.ylabel("PCA 2")
+plt.title("Fate map of hybrid patterns (colored by next phase)")
+plt.legend(markerscale=2, fontsize=8)
+plt.tight_layout()
+plt.show()
+
+
+# In[30]:
+
+
+## side-by-side fate maps in PCA/latent space
+
+hybrid_points = []
+hybrid_current_phases = []
+hybrid_next_phases = []
+
+for i in range(len(cluster_labels)):
+    c = cluster_labels[i]
+    if c not in hybrid_clusters:
+        continue
+
+    y, x = xy_sorted[i]
+    T = temps_sorted[i]
+
+    # require T+1 to exist
+    if (y, x, T+1) not in lookup_idx:
+        continue
+
+    j = lookup_idx[(y, x, T+1)]
+    next_phase = phase_all[j]
+    current_phase = phase_all[i]
+
+    hybrid_points.append(latents_all_pca[i])
+    hybrid_current_phases.append(current_phase)
+    hybrid_next_phases.append(next_phase)
+
+hybrid_points = np.array(hybrid_points)
+hybrid_current_phases = np.array(hybrid_current_phases)
+hybrid_next_phases = np.array(hybrid_next_phases)
+
+# unique phases
+phases_current = sorted(set(hybrid_current_phases))
+phases_next = sorted(set(hybrid_next_phases))
+
+# consistent colormap
+cmap = plt.cm.tab10
+colors_current = cmap(np.linspace(0, 1, len(phases_current)))
+colors_next = cmap(np.linspace(0, 1, len(phases_next)))
+
+color_current = {p: colors_current[k] for k, p in enumerate(phases_current)}
+color_next = {p: colors_next[k] for k, p in enumerate(phases_next)}
+
+# ---- plotting ----
+fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+# LEFT: current phase
+ax = axes[0]
+for p in phases_current:
+    mask = (hybrid_current_phases == p)
+    ax.scatter(hybrid_points[mask, 0],
+               hybrid_points[mask, 1],
+               s=10, alpha=0.6, color=color_current[p], label=p)
+ax.set_title("Hybrid patterns colored by CURRENT phase")
+ax.set_xlabel("PCA 1")
+ax.set_ylabel("PCA 2")
+ax.legend(markerscale=2, fontsize=8)
+
+# RIGHT: next phase
+ax = axes[1]
+for p in phases_next:
+    mask = (hybrid_next_phases == p)
+    ax.scatter(hybrid_points[mask, 0],
+               hybrid_points[mask, 1],
+               s=10, alpha=0.6, color=color_next[p], label=p)
+ax.set_title("Hybrid patterns colored by NEXT phase")
+ax.set_xlabel("PCA 1")
+ax.set_ylabel("PCA 2")
+ax.legend(markerscale=2, fontsize=8)
+
+plt.tight_layout()
+plt.show()
+
+
+# In[34]:
+
+
+import numpy as np
+from collections import defaultdict
+
+# Identify A/C cluster IDs
+ac_clusters = [c for c, p in cluster_to_phase.items() if p == "A/C"]
+print("A/C clusters:", ac_clusters)
+
+lookup_idx = {}
+for i in range(len(phase_all)):
+    y, x = xy_sorted[i]
+    T = temps_sorted[i]
+    lookup_idx[(y, x, T)] = i
+
+X = []   
+y = [] 
+indices = []  # store original indices
+
+for i in range(len(cluster_labels)):
+    if cluster_labels[i] not in ac_clusters:
+        continue
+
+    yx = tuple(xy_sorted[i])
+    T = temps_sorted[i]
+
+    if (yx[0], yx[1], T+1) not in lookup_idx:
+        continue
+
+    j = lookup_idx[(yx[0], yx[1], T+1)]
+    next_phase = phase_all[j]
+
+    # Only consider A or C as next-phase outcomes
+    if next_phase not in ["A", "C"]:
+        continue
+
+    X.append(latents_all_pca[i])
+    y.append(1 if next_phase == "C" else 0)
+    indices.append(i)
+
+X = np.array(X)
+y = np.array(y)
+indices = np.array(indices)
+
+print("A/C samples:", len(X))
+print("A→C ratio:", y.mean())
+
+
+# In[35]:
+
+
+from sklearn.linear_model import LogisticRegression
+
+logreg = LogisticRegression(max_iter=5000)
+logreg.fit(X, y)
+
+w = logreg.coef_[0] 
+b = logreg.intercept_[0]
+
+print("w shape:", w.shape)
+print("intercept:", b)
+
+
+# In[36]:
+
+
+# Reaction coordinate
+xi = X @ w + b
+
+# Commitment prob
+s = 1 / (1 + np.exp(-xi))
+
+import matplotlib.pyplot as plt
+
+plt.figure(figsize=(6,4))
+plt.scatter(xi, y, alpha=0.3, label="data")
+plt.xlabel("Reaction coordinate ξ = wᵀz")
+plt.ylabel("Next-phase label (0=A, 1=C*)")
+plt.title("A/C* logistic regression: reaction coordinate vs outcome")
+
+xi_sorted = np.sort(xi)
+s_sorted = 1 / (1 + np.exp(-(xi_sorted)))
+plt.plot(xi_sorted, s_sorted, color="red", linewidth=2, label="sigmoid fit")
+
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+
+# ### Idea: PC vs commitment/reaction coordinate
+
+# In[37]:
+
+
+plt.figure(figsize=(6,5))
+plt.scatter(X[:,0], X[:,1], c=s, cmap="coolwarm", s=20)
+plt.colorbar(label="Commitment probability s (to C*)")
+plt.xlabel("PCA 1")
+plt.ylabel("PCA 2")
+plt.title("A/C* fate map and logistic regression commitment probability")
+plt.tight_layout()
+plt.show()
+
+
+# In[43]:
+
+
+transition_mask = (s > 0.2) & (s < 0.8)
+transition_indices = indices[transition_mask]
+
+print("Number of transition-state patterns:", len(transition_indices))
+
+
+# ### Idea: try feeding w through decoder, vary w with a point near s=0.5
+
+# In[44]:
+
+
+def show_patterns(idx_list, title, n=12):
+    sel = np.random.choice(idx_list, size=min(n, len(idx_list)), replace=False)
+    rows = int(np.ceil(len(sel)/4))
+    plt.figure(figsize=(12, 3*rows))
+    for k, idx in enumerate(sel):
+        plt.subplot(rows, 4, k+1)
+        plt.imshow(all_originals_sorted[idx].squeeze(), cmap="inferno")
+        y, x = xy_sorted[idx]
+        T = temps_sorted[idx]
+        plt.title(f"T={T}")
+        plt.axis("off")
+    plt.suptitle(title)
+    plt.tight_layout()
+    plt.show()
+
+show_patterns(transition_indices, "A/C transition-state patterns (s ≈ 0.5)")
+
+
+# In[45]:
+
+
+# # Normalize w for visualization
+# w_norm = w / np.linalg.norm(w)
+
+# plt.figure(figsize=(6,5))
+# plt.scatter(X[:,0], X[:,1], c=y, cmap="bwr", alpha=0.4)
+# plt.quiver(0, 0, w_norm[0], w_norm[1], scale=3, color="black", width=0.01)
+# plt.xlabel("PCA 1")
+# plt.ylabel("PCA 2")
+# plt.title("Direction of steepest change (w) in PCA space")
+# plt.tight_layout()
+# plt.show()
+
+
+# In[46]:
+
+
+### looking at As
+# indices where current phase is A
+A_idx = np.where(phase_all == "A")[0]
+
+X = []
+y = []
+idx_keep = []
+
+for i in A_idx:
+    y0, x0 = xy_sorted[i]
+    T = temps_sorted[i]
+
+    if (y0, x0, T+1) not in lookup_idx:
+        continue
+
+    j = lookup_idx[(y0, x0, T+1)]
+    next_phase = phase_all[j]
+
+    # 1 = single-crystal (C or R), 0 = everything else
+    label = 1 if next_phase in ["C", "R"] else 0
+
+    X.append(latents_all_pca[i])
+    y.append(label)
+    idx_keep.append(i)
+
+X = np.array(X)
+y = np.array(y)
+idx_keep = np.array(idx_keep)
+
+print("A patterns used:", len(X))
+print("Fraction going to C or R:", y.mean())
+
+
+# In[47]:
+
+
+from sklearn.linear_model import LogisticRegression
+
+logreg_single = LogisticRegression(max_iter=5000)
+logreg_single.fit(X, y)
+
+w_single = logreg_single.coef_[0]
+b_single = logreg_single.intercept_[0]
+
+print("w_single shape:", w_single.shape)
+print("b_single:", b_single)
+
+xi_single = X @ w_single + b_single
+s_single = 1 / (1 + np.exp(-xi_single))
+
+
+# ### IDEA: what about the neighboring part? And the huge overlap is bad
+
+# In[48]:
+
+
+import matplotlib.pyplot as plt
+
+plt.figure(figsize=(6,4))
+plt.scatter(xi_single, y, alpha=0.3, label="data")
+plt.xlabel("Reaction coordinate ξ = wᵀz")
+plt.ylabel("Next-phase label (0=not single crystal, 1=single crystal)")
+plt.title("A → (C or R) logistic regression")
+
+# sigmoid
+xi_sorted = np.sort(xi_single)
+s_sorted = 1 / (1 + np.exp(-xi_sorted))
+plt.plot(xi_sorted, s_sorted, color="red", linewidth=2, label="sigmoid")
+
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+
+# In[49]:
+
+
+# thresholds
+high_thresh = 0.8
+low_thresh  = 0.2
+
+A_high = idx_keep[s_single > high_thresh]   # suspicious A 
+A_low  = idx_keep[s_single < low_thresh]    # stable A 
+
+
+# In[52]:
+
+
+import numpy as np
+
+A_center = latents_all_pca[A_idx].mean(axis=0)
+
+#distances = np.linalg.norm(latents_train_pca - latents_train_pca[A_center], axis=1)
+# where A_center = mean of all A patterns
+
+dist_high = np.linalg.norm(latents_all_pca[A_high] - A_center, axis=1)
+dist_low  = np.linalg.norm(latents_all_pca[A_low]  - A_center, axis=1)
+
+print("Mean distance (high‑s A → C*):", dist_high.mean())
+print("Mean distance (low‑s stable A):", dist_low.mean())
+
+
+# In[53]:
+
+
+plt.figure(figsize=(6,5))
+plt.scatter(X[:,0], X[:,1], c=s_single, cmap="coolwarm", s=20)
+plt.colorbar(label="Commitment probability to C/R")
+plt.xlabel("PCA 1")
+plt.ylabel("PCA 2")
+plt.title("A-state fate map (probability of becoming single crystal)")
+plt.tight_layout()
+plt.show()
+
+
+# In[57]:
+
+
+transition_mask = (s_single > 0.45) & (s_single < 0.55)
+transition_indices = idx_keep[transition_mask]
+
+print("Number of transition-state A patterns:", len(transition_indices))
+
+
+def show_patterns(idx_list, title, n=16):
+    sel = np.random.choice(idx_list, size=min(n, len(idx_list)), replace=False)
+    rows = int(np.ceil(len(sel)/4))
+    plt.figure(figsize=(12, 3*rows))
+    for k, idx in enumerate(sel):
+        plt.subplot(rows, 4, k+1)
+        plt.imshow(all_originals_sorted[idx].squeeze(), cmap="inferno")
+        y0, x0 = xy_sorted[idx]
+        T = temps_sorted[idx]
+        plt.title(f"T={T}")
+        plt.axis("off")
+    plt.suptitle(title)
+    plt.tight_layout()
+    plt.show()
+
+show_patterns(transition_indices, "A → (C or R) transition-state patterns")
+
+
+# In[58]:
+
+
+from skimage.transform import warp_polar
+import numpy as np
+
+def polar_transform(im, radius=None, output_shape=None):
+    if radius is None:
+        radius = min(im.shape)//2
+    if output_shape is None:
+        output_shape = (360, radius)
+    polar = warp_polar(
+        im,
+        radius=radius,
+        output_shape=output_shape,
+        scaling='linear'
+    )
+    return polar  # (angles, radii)
+
+def crop_radial_range(polar_im, r_min, r_max):
+    """
+    polar_im: (angles, radii)
+    r_min, r_max: integer indices in radial axis
+    """
+    return polar_im[:, r_min:r_max]
+
+
+# In[59]:
+
+
+def compute_ccf(polar_im):
+    F = np.fft.fft(polar_im, axis=0)
+    power = np.abs(F)**2
+    ccf = np.real(np.fft.ifft(power, axis=0))
+
+    norm = np.sum(polar_im, axis=0)**2
+    mask = norm > 0
+    ccf[:, mask] /= norm[mask]
+    ccf[:, mask] -= 1
+    return ccf
+
+def extract_symmetry(ccf, max_sym=12):
+    F = np.fft.fft(ccf, axis=0)
+    sym = np.abs(F[:max_sym+1])
+    return sym
+
+
+def compute_symmetry_for_pattern(pattern, max_sym=12, r_min=18, r_max=35):
+    polar = polar_transform(pattern)
+    polar_crop = crop_radial_range(polar, r_min, r_max)
+    ccf = compute_ccf(polar_crop)
+    sym = extract_symmetry(ccf, max_sym=max_sym)
+    return sym  # (max_sym+1, r_max - r_min)
+
+
+
+# In[61]:
+
+
+max_sym = 12
+r_min, r_max = 18, 35
+
+ccf_high = []
+for idx in A_high:
+    pat = all_originals_sorted[idx].squeeze()
+    sym = compute_symmetry_for_pattern(pat, max_sym=max_sym, r_min=r_min, r_max=r_max)
+    ccf_high.append(sym)
+
+ccf_low = []
+for idx in A_low:
+    pat = all_originals_sorted[idx].squeeze()
+    sym = compute_symmetry_for_pattern(pat, max_sym=max_sym, r_min=r_min, r_max=r_max)
+    ccf_low.append(sym)
+
+ccf_high = np.array(ccf_high)
+ccf_low  = np.array(ccf_low)
+
+mean_high = ccf_high.mean(axis=0)
+mean_low  = ccf_low.mean(axis=0)
+
+
+# In[62]:
+
+
+from skimage.transform import warp_polar
+
+def polar_transform(im, radius=None, output_shape=None):
+    if radius is None:
+        radius = min(im.shape)//2
+    if output_shape is None:
+        output_shape = (720, radius)  # 0.5deg angular resolution
+    polar = warp_polar(
+        im,
+        radius=radius,
+        output_shape=output_shape,
+        scaling='linear'
+    )
+    return polar
+
+# pick a pattern index to inspect
+idx = A_high[20]  
+pat = all_originals_sorted[idx].squeeze()
+
+polar = polar_transform(pat)
+
+plt.figure(figsize=(10,4))
+
+plt.subplot(1,2,1)
+plt.imshow(pat, cmap="inferno")
+plt.title("Original pattern")
+plt.axis("off")
+
+plt.subplot(1,2,2)
+plt.imshow(polar, cmap="inferno", aspect='auto')
+plt.title("Polar transform (angle × radius)")
+plt.xlabel("Radius")
+plt.xlim([18, 70])
+plt.ylabel("Angle (degrees)")
+plt.tight_layout()
+plt.show()
+
+
+# In[63]:
+
+
+mean_high = ccf_high.mean(axis=0)
+mean_low  = ccf_low.mean(axis=0)
+
+import matplotlib.pyplot as plt
+
+plt.figure(figsize=(6,4))
+plt.plot(mean_low[:,0], label="Stable A", color="blue")
+plt.plot(mean_high[:,0], label="Incipient A", color="red")
+plt.xlabel("Harmonic (n-fold symmetry)")
+plt.ylabel("Amplitude")
+plt.ylim([0,0.01])
+plt.title("Mean CCF symmetry spectrum")
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+
+# In[64]:
+
+
+harmonics = [2, 4, 6]
+
+plt.figure(figsize=(8,4))
+for h in harmonics:
+    plt.plot(mean_low[h], label=f"Stable A — {h}-fold", linestyle="--")
+    plt.plot(mean_high[h], label=f"Incipient A — {h}-fold")
+plt.xlabel("Radial bin")
+plt.ylabel("CCF amplitude")
+#plt.xlim([0, 20])
+plt.title("Crystalline harmonics in amorphous patterns")
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+
+# In[65]:
+
+
+def crop_radial_range(polar_im, r_min=20, r_max=35):
+    return polar_im[:, r_min:r_max]
+
+def compute_1d_ccf(pattern, r_min=18, r_max=35):
+    polar = polar_transform(pattern)
+    polar_crop = crop_radial_range(polar, r_min, r_max)
+    ccf = compute_ccf(polar_crop)
+
+    # average over radii → gives C(k, theta))
+    ccf_1d = ccf.mean(axis=1)  # shape: (angles,)
+    return ccf_1d
+
+
+# In[66]:
+
+
+import matplotlib.pyplot as plt
+
+def plot_ccf_1d(ccf_1d):
+    angles = np.linspace(0, 2*np.pi, len(ccf_1d), endpoint=False)
+
+    plt.figure(figsize=(6,4))
+    plt.plot(angles, ccf_1d, linewidth=2)
+    plt.xlabel("Angular shift Δθ (rad)")
+    plt.ylabel("C(k, Δθ)")
+    plt.title("Cross-correlation function")
+    plt.tight_layout()
+    plt.show()
+
+
+# In[68]:
+
+
+idx = A_high[20]  # test on 1 pattern
+pat = all_originals_sorted[idx].squeeze()
+
+ccf_1d = compute_1d_ccf(pat, r_min=18, r_max=35)
+plot_ccf_1d(ccf_1d)
+
+
+# In[69]:
+
+
+def compute_1d_ccf(pattern, r_min=18, r_max=35):
+    polar = polar_transform(pattern)
+    polar_crop = crop_radial_range(polar, r_min, r_max)
+    ccf = compute_ccf(polar_crop)
+    ccf_1d = ccf.mean(axis=1)  # average
+    return ccf_1d  # shape: (n_angles,)
+
+
+# In[72]:
+
+
+ccf_high = []
+for idx in A_high:
+    pat = all_originals_sorted[idx].squeeze()
+    ccf_high.append(compute_1d_ccf(pat))
+
+ccf_low = []
+for idx in A_low:
+    pat = all_originals_sorted[idx].squeeze()
+    ccf_low.append(compute_1d_ccf(pat))
+
+ccf_high = np.array(ccf_high)  # (N_high, n_angles)
+ccf_low  = np.array(ccf_low)   # (N_low,  n_angles)
+
+mean_high = ccf_high.mean(axis=0)
+mean_low  = ccf_low.mean(axis=0)
+
+
+# In[73]:
+
+
+angles = np.linspace(0, 2*np.pi, len(mean_high), endpoint=False)
+
+plt.figure(figsize=(6,4))
+plt.plot(angles, mean_low,  label="Stable A (low s)",  color="gray", linestyle="--")
+plt.plot(angles, mean_high, label="Incipient A (high s)", color="red")
+plt.xlabel("Angular shift Δθ (rad)")
+plt.ylabel("C(k, Δθ)")
+plt.title("Mean CCF: stable vs incipient amorphous")
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+
+# In[74]:
+
+
+n_show = 200
+
+# choose random subsets
+n_high = min(n_show, len(ccf_high))
+n_low  = min(n_show, len(ccf_low))
+
+idx_high = np.random.choice(len(ccf_high), size=n_high, replace=False)
+idx_low  = np.random.choice(len(ccf_low),  size=n_low,  replace=False)
+
+mean_low_subset  = ccf_low[idx_low].mean(axis=0)
+mean_high_subset = ccf_high[idx_high].mean(axis=0)
+
+# create the figure
+plt.figure(figsize=(7,5))
+
+# plot low‑s A patterns
+for i in idx_low:
+    plt.plot(angles, ccf_low[i], color="gray", alpha=0.25, linewidth=1)
+
+# plot high‑s A pattern
+for i in idx_high:
+    plt.plot(angles, ccf_high[i], color="red", alpha=0.25, linewidth=1)
+
+plt.plot(angles, mean_low_subset,  color="black", linestyle="--", linewidth=2, label="Mean low‑q A")
+plt.plot(angles, mean_high_subset, color="darkred", linewidth=2, label="Mean high‑q A")
+
+plt.xlabel("Angular shift Δθ (rad)")
+plt.xlim([0,6.28])
+plt.ylabel("C(k, Δθ)")
+# plt.ylim([-0.99727, -0.99717])
+plt.title("Individual CCF curves with means")
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+
+# In[75]:
+
+
+def symmetry_scores_from_ccf_1d(ccf_1d, max_sym=12):
+    F = np.fft.fft(ccf_1d)
+    amps = np.abs(F[:max_sym+1])  # 0..max_sym
+    return amps  # symmetry amplitude per harmonic
+
+
+# In[76]:
+
+
+max_sym = 12
+
+sym_high = np.array([symmetry_scores_from_ccf_1d(c, max_sym) for c in ccf_high])
+sym_low  = np.array([symmetry_scores_from_ccf_1d(c, max_sym) for c in ccf_low])
+
+mean_sym_high = sym_high.mean(axis=0)
+mean_sym_low  = sym_low.mean(axis=0)
+
+
+# In[77]:
+
+
+for n in [2, 4, 6]:
+    print(f"Harmonic {n}: high={mean_sym_high[n]:.6f}, low={mean_sym_low[n]:.6f}")
+
+
+# In[78]:
+
+
+harmonics = np.arange(max_sym+1)
+
+# plt.figure(figsize=(6,4))
+# plt.plot(harmonics, mean_sym_low,  label="Stable A",  color="gray", linestyle="--")
+# plt.plot(harmonics, mean_sym_high, label="Incipient A", color="red")
+# plt.xlabel("Harmonic n (n-fold symmetry)")
+# plt.xlim([0, 0.001])
+# plt.ylabel("|C_n|")
+# plt.title("Symmetry spectrum from CCF")
+# plt.legend()
+# plt.tight_layout()
+# plt.show()
+
+
+# In[79]:
+
+
+from sklearn.cluster import KMeans
+
+n_clusters = 3
+kmeans_ccf = KMeans(n_clusters=n_clusters, random_state=0)
+labels_ccf = kmeans_ccf.fit_predict(np.vstack([ccf_high, ccf_low]))
+
+
+# In[80]:
+
+
+all_ccf = np.vstack([ccf_high, ccf_low])
+cluster_means = []
+for k in range(n_clusters):
+    cluster_means.append(all_ccf[labels_ccf == k].mean(axis=0))
+
+plt.figure(figsize=(6,4))
+for k, m in enumerate(cluster_means):
+    plt.plot(angles, m, label=f"Cluster {k}")
+plt.xlabel("Δθ (rad)")
+plt.ylabel("C(k, Δθ)")
+plt.title("CCF clusters")
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+
+# In[83]:
+
+
+# 2-fold symmetry score from 1D CCF
+def twofold_score(ccf_1d):
+    F = np.fft.fft(ccf_1d)
+    return np.abs(F[2])
+
+sym_map = np.full_like(phase_all, fill_value=np.nan, dtype=float)
+
+for idx in A_idx:  # all A patterns
+    pat = all_originals_sorted[idx].squeeze()
+    ccf_1d = compute_1d_ccf(pat)
+    score = twofold_score(ccf_1d)
+    y0, x0 = xy_sorted[idx]
+    # assuming you can map (y0,x0) to a 2D grid; if not, store per-index
+
+
+# In[ ]:
+
+
+
+
+
+# In[ ]:
+
+
+
+
+
+# In[ ]:
+
+
+# def calculate_symmetry(
+#     self, 
+#     max_symmetry = 12,
+#     mask_realspace = None,  # Optional 2D mask for real space
+#     return_all_positions = False,
+#     plot_result = True,
+# ):
+
+#     """
+#     This function calculates radial symmetry of amorphous diffraction patterns.
+#     """
+
+#     # Initialize output
+#     polar_symmetry_all = np.zeros((
+#         polardata.data_raw.shape[0],
+#         polardata.data_raw.shape[1],
+#         max_symmetry + 1,  # or max_symmetry/2 + 1
+#         polardata.polar_shape[1],
+#     ))
+
+#     # Loop over all probe positions
+#     for rx in range(polardata.data_raw.shape[0]):
+#         for ry in range(polardata.data_raw.shape[1]):
+#             im = polardata.transform(
+#                 polardata.data_raw.data[rx, ry],
+#             )
+#             polar_im = np.ma.getdata(im)
+#             polar_mask = np.ma.getmask(im)
+#             polar_im[polar_mask] = 0  # Set masked values to 0
+#             polar_mask = np.logical_not(polar_mask)  # Invert the mask
+
+#             if mask_realspace is not None:
+#                 mask_realspace_resized = mask_realspace[rx, ry] 
+
+#                 polar_im *= mask_realspace_resized
+#                 polar_mask *= mask_realspace_resized
+
+#             polar_corr = np.real(
+#                 np.fft.ifft(
+#                     np.abs(
+#                         np.fft.fft(
+#                             polar_im, 
+#                             axis=0,
+#                         )
+#                     )**2,
+#                     axis=0,
+#                 ),
+#             )
+#             polar_corr_norm = np.sum(
+#                 polar_im, 
+#                 axis=0,
+#             )**2
+#             sub = polar_corr_norm > 0
+#             polar_corr[:, sub] /= polar_corr_norm[sub]  # Avoid divide by 0 (False near center)
+#             polar_corr[:, sub] -= 1
+
+#             # Calculate normalized correlation of polar mask along angular direction (axis = 0)
+#             mask_corr = np.real(
+#                 np.fft.ifft(
+#                     np.abs(
+#                         np.fft.fft(
+#                             polar_mask.astype('float'), 
+#                             axis=0,
+#                         )
+#                     )**2,
+#                     axis=0,
+#                 ),
+#             )
+#             mask_corr_norm = np.sum(
+#                 polar_mask.astype('float'), 
+#                 axis=0,
+#             )**2
+#             sub = mask_corr_norm > 0
+#             mask_corr[:, sub] /= mask_corr_norm[sub]  # Avoid divide by 0 (False near center)
+#             mask_corr[:, sub] -= 1
+
+#             # Normalize polar correlation by mask correlation (beam stop removal)
+#             sub = np.abs(mask_corr) > 0
+#             polar_corr[sub] -= mask_corr[sub]
+
+#             # Measure symmetry
+#             polar_corr_sym = np.abs(np.fft.fft(polar_corr, axis=0))
+#             polar_symmetry_all[rx, ry] = polar_corr_sym[0:max_symmetry + 1]
+
+#     polar_symmetry = np.mean(polar_symmetry_all, axis=(0, 1))
+
+#     if return_all_positions:
+#         return polar_symmetry, polar_symmetry_all
+#     else:
+#         return polar_symmetry
+
+
+
+# In[ ]:
+
+
+# polar_symmetry, polar_symmetry_all = calculate_symmetry(
+#     max_symmetry=12,
+#     return_all_positions=True,
+#     plot_result=False
+# )
+
+
+# In[ ]:
+
+
+
+
+
+# In[87]:
+
+
+target_T = 7
+
+Ny = xy_sorted[:,0].max() + 1   # 57
+Nx = xy_sorted[:,1].max() + 1   # 70
+
+phase_map_str = np.full((Ny, Nx), "", dtype=object)
+
+for i in range(len(xy_sorted)):
+    if temps_sorted[i] == target_T:
+        y, x = xy_sorted[i]
+        phase_map_str[y, x] = phase_labels[i]   # <-- plain Python strings
+
+np.set_printoptions(threshold=np.inf, linewidth=200)
+# print(phase_map_str)
+
+
+# In[88]:
+
+
+flat_T0 = phase_map_str.flatten()   # length = 3990
+phase_map_wrapped = flat_T0.reshape(70, 57)
+print(phase_map_wrapped.shape)
+# (70, 57)
+phase_map_clean = phase_map_wrapped.astype(str)
+
+
+# In[89]:
+
+
+# import numpy as np
+# import matplotlib.pyplot as plt
+# from matplotlib.colors import ListedColormap
+
+# phase_colors = {
+#     "A": "#3b0f70",         # muted deep violet
+#     "P": "#7c1d6f",         # soft magenta-violet
+#     "R": "#b63679",         # muted rose-magenta
+#     "C": "#d95f5f",         # softened coral-red
+#     "C (messy)": "#f6a974", # warm muted apricot
+#     "T": "#f6e8c3",         # pale warm cream-yellow
+# }
+
+# unique_letters = list(phase_colors.keys())
+# letter_to_id = {letter: i for i, letter in enumerate(unique_letters)}
+
+# phase_id_map = np.vectorize(letter_to_id.get)(phase_map_clean)
+
+# cmap = ListedColormap([phase_colors[l] for l in unique_letters])
+
+# plt.figure(figsize=(6, 8))
+# plt.imshow(phase_id_map, cmap=cmap, interpolation='nearest')
+# plt.axis('off')
+# plt.title("Phase Map")
+
+# handles = [plt.Rectangle((0,0),1,1, color=phase_colors[l]) for l in unique_letters]
+# plt.legend(handles, unique_letters, bbox_to_anchor=(1.05, 1), loc='upper left')
+
+# plt.show()
+
+
+# In[92]:
+
+
+###Microstate trajectories
+
+traj_micro = defaultdict(list)
+
+for i in range(len(cluster_labels)):
+    y, x = xy_sorted[i]
+    T = temps_sorted[i]
+    c = cluster_labels[i]
+    traj_micro[(y, x)].append((T, c))
+
+for key in traj_micro:
+    traj_micro[key] = sorted(traj_micro[key], key=lambda x: x[0])
+
+
+n_micro = kmeans.n_clusters
+C_micro = np.zeros((n_micro, n_micro), dtype=int)
+
+for key, seq in traj_micro.items():
+    for (_, c1), (_, c2) in zip(seq[:-1], seq[1:]):
+        C_micro[c1, c2] += 1
+
+P_micro = C_micro / np.maximum(C_micro.sum(axis=1, keepdims=True), 1)
+
+
+# In[94]:
+
+
+c_test = cluster_labels[i_test]
+next_micro_probs = P_micro[c_test]
+
+
+def predict_transition_for_test_pattern_micro(i_test):
+    # microstate of test pattern
+    c = cluster_labels[i_test]
+
+    # microstate transition probabilities
+    micro_probs = P_micro[c]
+
+    # convert to phase-level probabilities
+    phase_probs = np.zeros(len(unique_phases))
+    for j, prob in enumerate(micro_probs):
+        phase_j = cluster_to_phase[j]
+        phase_id_j = phase_to_id[phase_j]
+        phase_probs[phase_id_j] += prob
+
+    return micro_probs, phase_probs
+
+
+# In[ ]:
+
+
+# micro_probs, phase_probs = predict_transition_for_test_pattern_micro(380)
+
+# print("Microstate transition probabilities:")
+# print(micro_probs)
+
+# print("Phase-level transition probabilities:")
+# for p, prob in zip(unique_phases, phase_probs):
+#     print(f"{p}: {prob:.3f}")
+
+
+# In[102]:
+
+
+# def show_transition_prediction(idx):
+#     # --- 1. Identify microstate and phase ---
+#     c = cluster_labels[idx]                 # microstate (KMeans cluster)
+#     phase = phase_all[idx]               # phase label
+#     phase_id = phase_to_id[phase]         # phase ID
+
+#     # --- 2. Microstate-level transition probabilities ---
+#     micro_probs = P_micro[c]
+
+#     # --- 3. Convert microstate transitions → phase transitions ---
+#     phase_probs = np.zeros(len(unique_phases))
+#     for j, prob in enumerate(micro_probs):
+#         phase_j = cluster_to_phase[j]
+#         phase_id_j = phase_to_id[phase_j]
+#         phase_probs[phase_id_j] += prob
+
+#     # --- 4. Print info ---
+#     print(f"Test index: {idx}")
+#     print(f"  Microstate (cluster): {c}")
+#     print(f"  Phase: {phase}")
+#     print(f"  Temperature: {temps_sorted[idx]}")
+
+#     print("\nMicrostate transition probabilities:")
+#     for j, prob in enumerate(micro_probs):
+#         print(f"  cluster {c} → cluster {j}: {prob:.3f}")
+
+#     print("\nPhase-level transition probabilities:")
+#     for p, prob in zip(unique_phases, phase_probs):
+#         print(f"  {phase} → {p}: {prob:.3f}")
+
+#     # --- 5. Show the pattern ---
+#     plt.figure(figsize=(4,4))
+#     plt.imshow(all_originals_sorted[idx].squeeze(), cmap="inferno")
+#     plt.title(f"Pattern {idx} — Phase {phase}, Cluster {c}")
+#     plt.axis("off")
+#     plt.show()
+
+#     return micro_probs, phase_probs
+
+
+# In[103]:
+
+
+# micro_probs, phase_probs = show_transition_prediction(2905)
+
+
+# In[106]:
+
+
+# ### soft MSM
+
+# import numpy as np
+
+# def soft_membership(z, kmeans, beta=1.0):
+#     """
+#     z: (d,) latent or PCA vector
+#     kmeans: fitted KMeans
+#     beta: softness (larger = sharper, smaller = smoother)
+#     """
+#     centers = kmeans.cluster_centers_          # (K, d)
+#     d2 = np.sum((centers - z)**2, axis=1)      # (K,)
+#     # negative distance → higher weight
+#     logits = -beta * d2
+#     w = np.exp(logits - logits.max())
+#     w /= w.sum()
+#     return w    # (K,)
+
+# from collections import defaultdict
+
+# traj_micro = defaultdict(list)
+
+# for i in range(len(cluster_labels)):
+#     y, x = xy_sorted[i]
+#     T = temps_sorted[i]
+#     c = cluster_labels[i]
+#     traj_micro[(y, x)].append((T, c))
+
+# for key in traj_micro:
+#     traj_micro[key] = sorted(traj_micro[key], key=lambda x: x[0])
+
+# K = kmeans.n_clusters
+# C_micro = np.zeros((K, K), dtype=int)
+
+# for key, seq in traj_micro.items():
+#     for (_, c1), (_, c2) in zip(seq[:-1], seq[1:]):
+#         C_micro[c1, c2] += 1
+
+# P_micro = C_micro / np.maximum(C_micro.sum(axis=1, keepdims=True), 1)
+
+
+
+# In[111]:
+
+
+# def predict_transition_soft(idx, use_pca=False, beta=1.0):
+#     # 1) get feature vector for this test pattern
+#     if use_pca:
+#         z = latents_all_pca[idx]      # (d,)
+#     else:
+#         z = latents_sorted[idx]          # (d,)
+
+#     # 2) soft memberships over microstates
+#     chi = soft_membership(z, kmeans, beta=beta)   # (K,)
+
+#     # 3) microstate-level transition probs
+#     micro_probs = chi @ P_micro                  # (K,)
+
+#     # 4) aggregate to phase-level probs
+#     phase_probs = np.zeros(len(unique_phases))
+#     for j, prob in enumerate(micro_probs):
+#         phase_j = cluster_to_phase[j]
+#         phase_id_j = phase_to_id[phase_j]
+#         phase_probs[phase_id_j] += prob
+
+#     return chi, micro_probs, phase_probs
+
+# import matplotlib.pyplot as plt
+# import numpy as np
+
+# def show_transition_soft(idx, use_pca=False, beta=1.0):
+#     # ---- 1. Get feature vector ----
+#     if use_pca:
+#         z = latents_all_pca[idx]      # PCA vector (64-d)
+#     else:
+#         z = latents_sorted[idx]          # latent vector (218-d)
+
+#     # ---- 2. Soft memberships over microstates ----
+#     chi = soft_membership(z, kmeans, beta=beta)   # shape (K,)
+
+#     # ---- 3. Microstate-level transition probabilities ----
+#     micro_probs = chi @ P_micro                  # shape (K,)
+
+#     # ---- 4. Phase-level transition probabilities ----
+#     phase_probs = np.zeros(len(unique_phases))
+#     for j, prob in enumerate(micro_probs):
+#         phase_j = cluster_to_phase[j]
+#         phase_id_j = phase_to_id[phase_j]
+#         phase_probs[phase_id_j] += prob
+
+#     # ---- 5. Determine predicted phase ----
+#     predicted_phase = unique_phases[np.argmax(phase_probs)]
+
+#     # ---- 6. Print information ----
+#     print(f"Test index: {idx}")
+#     print(f"Temperature: {temps_sorted[idx]}")
+#     print(f"Soft memberships χ_i (sum={chi.sum():.3f}):")
+#     print(chi)
+
+#     print("\nPhase-level transition probabilities:")
+#     for p, prob in zip(unique_phases, phase_probs):
+#         print(f"{p}: {prob:.3f}")
+
+#     print(f"\nPredicted next-phase (argmax): {predicted_phase}")
+
+#     # ---- 7. Show the pattern ----
+#     plt.figure(figsize=(4,4))
+#     plt.imshow(all_originals_sorted[idx].squeeze(), cmap="inferno")
+#     plt.title(f"Pattern {idx} — Current phase: {phase_all[idx]}\nPredicted next: {predicted_phase}")
+#     plt.axis("off")
+#     plt.show()
+
+#     return chi, micro_probs, phase_probs
+
+
+# In[112]:
+
+
+chi, micro_probs, phase_probs = show_transition_soft(400, use_pca=False, beta=2.0)
+
+# print("Soft memberships χ_i:")
+# print(chi)
+
+# print("\nPhase-level transition probabilities:")
+# for p, prob in zip(unique_phases, phase_probs):
+#     print(f"{p}: {prob:.3f}")
+
+
+# In[ ]:
+
+
+
+
+
+# In[115]:
+
+
+from collections import defaultdict
+import numpy as np
+
+# Build trajectories for each (y, x)
+traj = defaultdict(list)
+
+for i in range(len(latents_sorted)):
+    y, x = xy_sorted[i]
+    T = temps_sorted[i]
+    p = phase_id_all[i]
+    traj[(y, x)].append((T, p))
+
+# Sort each trajectory by temperature
+for key in traj:
+    traj[key] = sorted(traj[key], key=lambda x: x[0])
+
+# Count transitions
+n_phases = len(unique_phases)
+C_phase = np.zeros((n_phases, n_phases), dtype=int)
+
+for key, seq in traj.items():
+    for (T1, p1), (T2, p2) in zip(seq[:-1], seq[1:]):
+        C_phase[p1, p2] += 1
+
+row_sums = C_phase.sum(axis=1, keepdims=True)
+P_phase = C_phase / np.maximum(row_sums, 1)
+
+
+# In[121]:
+
+
+# --- 1. Define hybrid phase names ---
+hybrid_labels = {"A/C", "C/T", "C/P", "T/P", "A/T", "A/P", "R/T"}
+
+# --- 2. Convert cluster labels → phase labels (strings) ---
+phase_labels = np.array([cluster_to_phase[c] for c in cluster_labels])
+
+# --- 3. Collapse all hybrid labels into "H" ---
+phase_labels_collapsed = np.array([
+    "H" if p in hybrid_labels else p
+    for p in phase_labels
+])
+
+# --- 4. Build new unique phase list ---
+unique_phases_collapsed = sorted(set(phase_labels_collapsed))
+
+# Map phase → integer ID
+phase_to_id = {p: i for i, p in enumerate(unique_phases_collapsed)}
+
+# Convert collapsed labels to IDs
+phase_ids_collapsed = np.array([phase_to_id[p] for p in phase_labels_collapsed])
+
+# --- 5. Build table as before ---
+T_unique_all = np.sort(np.unique(temps_sorted))
+n_temps = len(T_unique_all)
+n_phases = len(unique_phases_collapsed)
+
+phase_counts = np.zeros((n_phases, n_temps), dtype=int)
+temp_to_idx = {T: i for i, T in enumerate(T_unique_all)}
+
+for key, seq in traj.items():
+    for (T, p_int) in seq:
+        t_idx = temp_to_idx[T]
+
+        # Convert integer phase ID → string phase label
+        p_str = cluster_to_phase[p_int]
+
+        # Collapse hybrids
+        p_str = "H" if p_str in hybrid_labels else p_str
+
+        # Count
+        p_idx = phase_to_id[p_str]
+        phase_counts[p_idx, t_idx] += 1
+
+# --- 6. Print table ---
+col_width = 12
+header = "Temp".ljust(col_width) + "".join(p.ljust(col_width) for p in unique_phases_collapsed)
+print(header)
+print("-" * len(header))
+
+for ti, T in enumerate(T_unique_all):
+    row = str(T).ljust(col_width)
+    for p in range(n_phases):
+        row += str(phase_counts[p, ti]).ljust(col_width)
+    print(row)
+
+
+# In[126]:
+
+
+T_unique_train = np.sort(np.unique(temps_train))
+n_temps = len(T_unique_train)
+n_phases = len(unique_phases)
+
+# Initialize count matrix
+phase_counts = np.zeros((n_phases, n_temps), dtype=int)
+
+# Map temperature → index
+temp_to_idx = {T: i for i, T in enumerate(T_unique_train)}
+
+# Count occurrences
+for key, seq in traj.items():
+    for (T, p) in seq:
+        t_idx = temp_to_idx[T]
+        phase_counts[p, t_idx] += 1
+
+# ---- Convert counts → fractions ----
+col_sums = phase_counts.sum(axis=0, keepdims=True)
+phase_fractions = phase_counts / col_sums
+
+# Pretty printing
+col_width = 14
+
+header = "Temp".ljust(col_width) + "".join(p.ljust(col_width) for p in unique_phases)
+print(header)
+print("-" * len(header))
+
+for ti, T in enumerate(T_unique_train):
+    row = str(T).ljust(col_width)
+    for p in range(n_phases):
+        row += f"{phase_fractions[p, ti]:.2f}".ljust(col_width)
+    print(row)
+
+
+# In[127]:
+
+
+col_width = 20
+
+header = "From/To".ljust(col_width) + "".join(p.ljust(col_width) for p in unique_phases)
+print(header)
+print("-" * len(header))
+
+for i, p in enumerate(unique_phases):
+    row = p.ljust(col_width)
+    for j in range(n_phases):
+        row += f"{P_phase[i,j]:.3f}".ljust(col_width)
+    print(row)
+
+
+# In[128]:
+
+
+def compute_transition_matrix(traj, Tmin, Tmax, n_phases):
+    C = np.zeros((n_phases, n_phases), dtype=int)
+
+    for key, seq in traj.items():
+        # iterate over consecutive pairs
+        for (T1, p1), (T2, p2) in zip(seq[:-1], seq[1:]):
+            # include only transitions fully inside the range
+            if Tmin <= T1 <= Tmax and Tmin <= T2 <= Tmax:
+                C[p1, p2] += 1
+
+    # normalize rows
+    row_sums = C.sum(axis=1, keepdims=True)
+    P = C / np.maximum(row_sums, 1)
+    return C, P
+
+
+# In[ ]:
+
+
+C_0_4, P_0_4 = compute_transition_matrix(traj, Tmin=0, Tmax=4, n_phases=len(unique_phases))
+C_5_7, P_5_7 = compute_transition_matrix(traj, Tmin=5, Tmax=7, n_phases=len(unique_phases))
+# C_0_1, P_0_1 = compute_transition_matrix(traj, Tmin=0, Tmax=1, n_phases=len(unique_phases))
+# C_1_2, P_1_2 = compute_transition_matrix(traj, Tmin=1, Tmax=2, n_phases=len(unique_phases))
+# C_2_3, P_2_3 = compute_transition_matrix(traj, Tmin=2, Tmax=3, n_phases=len(unique_phases))
+# C_3_4, P_3_4 = compute_transition_matrix(traj, Tmin=3, Tmax=4, n_phases=len(unique_phases))
+# C_4_5, P_4_5 = compute_transition_matrix(traj, Tmin=4, Tmax=5, n_phases=len(unique_phases))
+# C_5_6, P_5_6 = compute_transition_matrix(traj, Tmin=5, Tmax=6, n_phases=len(unique_phases))
+# C_6_7, P_6_7 = compute_transition_matrix(traj, Tmin=6, Tmax=7, n_phases=len(unique_phases))
+
+
+# In[ ]:
+
+
+def print_transition_table(P, unique_phases, title):
+    col_width = 10
+    print("\n" + title)
+    header = "From/To".ljust(col_width) + "".join(p.ljust(col_width) for p in unique_phases)
+    print(header)
+    print("-" * len(header))
+
+    for i, p in enumerate(unique_phases):
+        row = p.ljust(col_width)
+        for j in range(len(unique_phases)):
+            row += f"{P[i,j]:.2f}".ljust(col_width)
+        print(row)
+
+print_transition_table(P_0_4, unique_phases, "Transition Table for Temp Steps 0–4")
+print_transition_table(P_5_7, unique_phases, "Transition Table for Temp Steps 5–7")
+
+# print_transition_table(P_0_1, unique_phases, "Transition Table for Temp Steps 0-1")
+# print_transition_table(P_1_2, unique_phases, "Transition Table for Temp Steps 1–2")
+# print_transition_table(P_2_3, unique_phases, "Transition Table for Temp Steps 2–3")
+# print_transition_table(P_3_4, unique_phases, "Transition Table for Temp Steps 3–4")
+# print_transition_table(P_4_5, unique_phases, "Transition Table for Temp Steps 4–5")
+# print_transition_table(P_5_6, unique_phases, "Transition Table for Temp Steps 5–6")
+# print_transition_table(P_6_7, unique_phases, "Transition Table for Temp Steps 6–7")
+
+
+# In[ ]:
+
+
+
+
+
+# In[ ]:
+
+
+
+
+
+# In[ ]:
+
+
+
+
+
+# In[ ]:
+
+
+
+
+
+# In[ ]:
+
+
+
+
+
+# In[ ]:
+
+
+
+
+
+# In[ ]:
+
+
+
+
+
+# In[ ]:
+
+
+T_unique_train = np.unique(temps_train)
+temp_to_idx_train = {T: i for i, T in enumerate(T_unique_train)}
+
+Ny = xy_train[:,0].max() + 1
+Nx = xy_train[:,1].max() + 1
+
+phase_id_grid_train = np.full((len(T_unique_train), Ny, Nx), -1, dtype=int)
+
+for i in range(len(latents_train)):
+    y, x = xy_train[i]
+    T = temps_train[i]
+    t_idx = temp_to_idx_train[T]
+    phase_id_grid_train[t_idx, y, x] = phase_id_train[i]
+
+
+# In[ ]:
+
+
+# for t in range(len(T_unique_train)):
+#     missing = np.sum(phase_id_grid_train[t] < 0)
+#     print(f"T index {t}: missing {missing} pixels")
+
+
+# In[ ]:
+
+
+n_phases = len(unique_phases)
+n_temps_train = phase_id_grid_train.shape[0]
+
+C_phase_train = np.zeros((n_phases, n_phases), dtype=int)
+
+for t in range(n_temps_train - 1):
+    A = phase_id_grid_train[t].ravel()
+    B = phase_id_grid_train[t+1].ravel()
+    for a, b in zip(A, B):
+        if a >= 0 and b >= 0:
+            C_phase_train[a, b] += 1
+
+row_sums = C_phase_train.sum(axis=1, keepdims=True)
+P_phase_train = C_phase_train / np.maximum(row_sums, 1)
+
+
+# In[95]:
+
+
+i_all = 2905
+
+current_phase_id = phase_id_all[i_test]
+current_phase_name = unique_phases[current_phase_id]
+
+next_phase_probs = P_phase_train[current_phase_id]
+
+print("Current phase:", current_phase_name)
+for p, prob in zip(unique_phases, next_phase_probs):
+    print(f"{current_phase_name} → {p}: {prob:.3f}")
+
+plt.figure(figsize=(4,4))
+plt.imshow(patterns_test[i_test].squeeze(), cmap="inferno")
+plt.title(f"Test pattern {i_test}")
+plt.axis("off")
+plt.show()
+
+
+# In[ ]:
+
+
+import matplotlib.pyplot as plt
+
+def show_test_example(idx):
+    print(f"Global test index: {idx}")
+    print("  temp:", temps_test[idx])
+    print("  cluster:", cluster_test[idx])
+    print("  phase:", phase_test[idx])
+
+    plt.figure(figsize=(4,4))
+    plt.imshow(patterns_test[idx].squeeze(), cmap="inferno")
+    plt.title(f"Test pattern {idx} — {phase_test[idx]}")
+    plt.axis("off")
+    plt.show()
+
+show_test_example(5)
+show_test_example(20)
+show_test_example(30)
+
+
+# In[141]:
+
+
+from sklearn.decomposition import PCA
+from sklearn.cluster import KMeans
+
+pca = PCA(n_components=64)
+latents_2d = pca.fit_transform(latents_sorted)
+
+kmeans = KMeans(n_clusters=50, random_state=0)
+cluster_labels = kmeans.fit_predict(latents_sorted)   # (N,)
+
+
+# In[151]:
+
+
+plt.figure(figsize=(8,6))
+plt.scatter(latents_2d[:,0], latents_2d[:,1],
+            c=cluster_labels, cmap="viridis", s=5)
+plt.title("K-Means Clusters in PCA space")
+plt.xlabel("PCA 1")
+plt.ylabel("PCA 2")
+plt.colorbar(label="Cluster")
+plt.show()
+
+
+# In[148]:
+
+
+import matplotlib.pyplot as plt
+import numpy as np
+from matplotlib.colors import ListedColormap
+
+# Build mid-range plasma colormap
+base = plt.cm.viridis
+colors = base(np.linspace(0.00, 1.00, 256))
+plasma_mid = ListedColormap(colors)
+
+plt.figure(figsize=(8,6))
+plt.scatter(
+    latents_2d[:,0],
+    latents_2d[:,1],
+    c=temps_sorted,
+    cmap=plasma_mid,
+    s=5
+)
+plt.title("PCA Space Colored by Temperature Step)")
+plt.xlabel("PCA 1")
+plt.ylabel("PCA 2")
+plt.colorbar(label="Temperature Step")
+plt.show()
+
+
+# In[200]:
+
+
+import matplotlib.pyplot as plt
+import numpy as np
+from matplotlib.colors import ListedColormap
+
+# Build mid-range plasma colormap (your preference)
+base = plt.cm.viridis
+colors = base(np.linspace(0.00, 1.00, 256))
+plasma_mid = ListedColormap(colors)
+
+pairs = [(0,1), (2,3), (4,5), (6,7)]
+
+plt.figure(figsize=(12, 10))
+
+for i, (t0, t1) in enumerate(pairs, 1):
+    mask = np.isin(temps_sorted, [t0, t1])
+
+    plt.subplot(2, 2, i)
+    plt.scatter(
+        latents_2d[mask, 0],
+        latents_2d[mask, 1],
+        c=temps_sorted[mask],
+        cmap=plasma_mid,
+        s=5
+    )
+    plt.title(f"PCA Space: Temp Steps {t0} & {t1}")
+    plt.xlabel("PCA 1")
+    plt.ylabel("PCA 2")
+
+    cb = plt.colorbar()
+    cb.set_label("Temperature Step")
+
+plt.tight_layout()
+plt.show()
+
+
+# In[201]:
+
+
+import matplotlib.pyplot as plt
+import numpy as np
+from matplotlib.colors import ListedColormap
+
+# Base colormap
+base = plt.cm.viridis
+
+pairs = [(0,1), (2,3), (4,5), (6,7)]
+
+# Make 4 distinct 2‑color colormaps from viridis
+submaps = []
+for i in range(4):
+    # Take a slice of viridis for this panel
+    lo = i / 4
+    hi = (i + 1) / 4
+    colors = base(np.linspace(lo, hi, 256))
+    submaps.append(ListedColormap(colors))
+
+plt.figure(figsize=(12, 10))
+
+for i, ((t0, t1), cmap) in enumerate(zip(pairs, submaps), 1):
+    mask = np.isin(temps_sorted, [t0, t1])
+
+    plt.subplot(2, 2, i)
+    plt.scatter(
+        latents_2d[mask, 0],
+        latents_2d[mask, 1],
+        c=temps_sorted[mask],
+        cmap=cmap,
+        s=5
+    )
+    plt.title(f"PCA Space: Temp Steps {t0} & {t1}")
+    plt.xlabel("PCA 1")
+    plt.ylabel("PCA 2")
+
+    cb = plt.colorbar()
+    cb.set_label("Temperature Step")
+
+plt.tight_layout()
+plt.show()
+
+
+# In[ ]:
+
+
+
+
+
+# In[85]:
+
+
+phase_labels = np.array([cluster_to_phase[c] for c in cluster_labels])
+unique_phases = sorted(set(phase_labels))
+phase_to_id = {p: i for i, p in enumerate(unique_phases)}
+phase_ids = np.array([phase_to_id[p] for p in phase_labels])
+
+
+
+# In[ ]:
+
+
+
+
+
+# In[ ]:
+
+
+
+
+
+# In[86]:
+
+
+# microstate label per pattern
+micro_labels_kmeans = cluster_labels_2d     # shape (N,)
+n_micro_kmeans = micro_labels_kmeans.max() + 1
+
+
+# In[ ]:
+
+
+rng = np.random.default_rng(0)
+n_show = 6
+clusters = np.unique(cluster_labels)
+
+for k in clusters:
+    idx = np.where(cluster_labels == k)[0]
+    print(f"Cluster {k}: {len(idx)} patterns")
+
+    sel = rng.choice(idx, size=min(n_show, len(idx)), replace=False)
+
+    fig, axes = plt.subplots(1, len(sel), figsize=(3*len(sel), 3))
+    if len(sel) == 1:
+        axes = [axes]
+
+    for ax, i in zip(axes, sel):
+        img = all_originals_sorted[i].squeeze()
+        ax.imshow(img, cmap="inferno")
+        ax.axis("off")
+
+    fig.suptitle(f"KMeans Cluster {k} (n={len(idx)})")
+    plt.tight_layout()
+    plt.show()
+
+
+# In[ ]:
+
+
+# cluster_to_phase = {
+#     0: "amorphous",
+#     1: "twinned",
+#     2: "recrystallized",
+#     3: "amorphous",
+#     4: "twinned",
+#     5: "amorphous",
+#     6: "recrystallized",
+#     7: "amorphous",
+#     8: "amorphous",
+#     9: "amorphous",
+#     10: "recrystallized",
+#     11: "crystalline",
+#     12: "polycrystalline",
+#     13: "polycrystalline",
+#     14: "twinned",
+#     15: "twinned",
+#     16: "amorphous",
+#     17: "recrystallized",
+#     18: "recrystallized",
+#     19: "crystalline",
+#     20: "twinned",
+#     21: "crystalline",
+#     22: "twinned",
+#     23: "twinned",
+#     24: "recrystallized",
+#     25: "polycrystalline",
+#     26: "polycrystalline",
+#     27: "crystalline",
+# }
+
+# phase_labels = np.array([cluster_to_phase[c] for c in cluster_labels])
+
+
+# In[ ]:
+
+
+unique_phases = sorted(set(phase_labels))
+phase_to_id = {p: i for i, p in enumerate(unique_phases)}
+phase_ids = np.array([phase_to_id[p] for p in phase_labels])
+
+
+# In[ ]:
+
+
+unique_xy = np.unique(xy_sorted, axis=0)
+
+# track one specific (x0, y0)
+x0, y0 = 1, 42
+mask_xy = (xy_sorted[:,0] == x0) & (xy_sorted[:,1] == y0)
+
+temps_xy = temps_sorted[mask_xy]
+clusters_xy = cluster_labels[mask_xy]
+
+# sort by temperature
+order = np.argsort(temps_xy)
+temps_xy = temps_xy[order]
+clusters_xy = clusters_xy[order]
+
+print("Temps:", temps_xy)
+print("Clusters:", clusters_xy)
+
+
+# In[ ]:
+
+
+T_unique = np.unique(temps_sorted)
+temp_to_idx = {T: i for i, T in enumerate(T_unique)}
+
+Ny = xy_sorted[:,0].max() + 1
+Nx = xy_sorted[:,1].max() + 1
+
+cluster_grid = np.full((len(T_unique), Ny, Nx), -1, dtype=int)
+
+for i in range(len(latents_sorted)):
+    y, x = xy_sorted[i]
+    T = temps_sorted[i]
+    t_idx = temp_to_idx[T]
+    cluster_grid[t_idx, y, x] = cluster_labels[i]
+
+
+# In[ ]:
+
+
+all_trajectories_array = np.transpose(cluster_grid, (1, 2, 0))
+
+phase_grid = np.vectorize(cluster_to_phase.get)(cluster_grid)
+phase_id_grid = np.vectorize(phase_to_id.get)(phase_grid)
+
+
+# In[ ]:
+
+
+import numpy as np
+
+n_phases = len(unique_phases)
+n_temps = phase_id_grid.shape[0]
+
+# Count transitions
+C_phase = np.zeros((n_phases, n_phases), dtype=int)
+
+for t in range(n_temps - 1):
+    A = phase_id_grid[t].ravel()
+    B = phase_id_grid[t+1].ravel()
+    for a, b in zip(A, B):
+        if a >= 0 and b >= 0:
+            C_phase[a, b] += 1
+
+# Normalize rows → transition probabilities
+row_sums = C_phase.sum(axis=1, keepdims=True)
+P_phase = C_phase / np.maximum(row_sums, 1)
+
+col_width = 20
+
+header = "From/To".ljust(col_width) + "".join(p.ljust(col_width) for p in unique_phases)
+print(header)
+print("-" * len(header))
+
+for i, p in enumerate(unique_phases):
+    row = p.ljust(col_width)
+    for j in range(n_phases):
+        row += f"{P_phase[i,j]:.3f}".ljust(col_width)
+    print(row)
+
+
+# In[ ]:
+
+
+phase_counts = np.zeros((n_phases, n_temps), dtype=int)
+
+for t in range(n_temps):
+    slice_t = phase_id_grid[t].ravel()
+    for p in range(n_phases):
+        phase_counts[p, t] = np.sum(slice_t == p)
+
+col_width = 20
+
+header = "Temp".ljust(8) + "".join(p.ljust(col_width) for p in unique_phases)
+print(header)
+print("-" * len(header))
+
+for ti, T in enumerate(T_actual):
+    row = str(T).ljust(8)
+    for p in range(n_phases):
+        row += str(phase_counts[p, ti]).ljust(col_width)
+    print(row)
+
+
+# In[ ]:
+
+
+import matplotlib.pyplot as plt
+import numpy as np
+
+T_actual = np.array([25, 50, 100, 150, 200, 250, 300, 350])
+
+# Convert counts to fractions
+phase_fractions = phase_counts / phase_counts.sum(axis=0, keepdims=True)
+
+plt.figure(figsize=(10, 6))
+
+# Use plasma colormap with as many colors as phases
+cmap = plt.get_cmap("plasma")
+colors = cmap(np.linspace(0, 1, len(unique_phases)))
+
+for i, phase in enumerate(unique_phases):
+    plt.plot(
+        T_actual,
+        phase_fractions[i],
+        marker='o',
+        linewidth=3,      # thicker lines
+        markersize=8,
+        color=colors[i],
+        label=phase
+    )
+
+plt.xlabel("Temperature (°C)")
+plt.ylabel("Fraction of Pixels")
+plt.title("Phase Fractions vs Temperature")
+plt.legend()
+plt.grid(alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+
+# In[ ]:
+
+
+import networkx as nx
+import matplotlib.pyplot as plt
+
+G = nx.DiGraph()
+
+# Add nodes
+for phase in unique_phases:
+    G.add_node(phase)
+
+# Add edges for transitions above threshold
+threshold = 0.05  # show only meaningful transitions
+
+for i, p_from in enumerate(unique_phases):
+    for j, p_to in enumerate(unique_phases):
+        prob = P_phase[i, j]
+        if prob > threshold:
+            G.add_edge(p_from, p_to, weight=prob)
+
+
+# In[ ]:
+
+
+plt.figure(figsize=(10, 6))
+
+pos = nx.spring_layout(G, seed=0, k=1.2)
+
+# Draw nodes
+nx.draw_networkx_nodes(G, pos, node_size=2000, node_color="lightblue")
+
+# Draw edges with thickness proportional to probability
+weights = [G[u][v]['weight'] * 8 for u, v in G.edges()]
+nx.draw_networkx_edges(G, pos, width=weights, arrowsize=20, arrowstyle='-|>')
+
+# Labels
+nx.draw_networkx_labels(G, pos, font_size=12, font_weight='bold')
+
+# Edge labels (probabilities)
+edge_labels = {(u, v): f"{G[u][v]['weight']:.2f}" for u, v in G.edges()}
+nx.draw_networkx_edge_labels(G, pos, edge_labels=edge_labels, font_size=10)
+
+plt.title("Phase-Level MSM Diagram")
+plt.axis("off")
+plt.show()
+
+
+# In[ ]:
+
+
+# import matplotlib.pyplot as plt
+# import numpy as np
+# from matplotlib.patches import FancyArrowPatch
+
+# # --- Inputs you already have ---
+# # unique_phases : list of phase names
+# # P_phase       : (n_phases, n_phases) transition probability matrix
+
+# n = len(unique_phases)
+
+# # Layout: place nodes vertically
+# y_positions = np.linspace(0.9, 0.1, n)
+# x_position = 0.1
+
+# fig, ax = plt.subplots(figsize=(10, 8))
+
+# # Draw nodes
+# for i, phase in enumerate(unique_phases):
+#     ax.text(x_position, y_positions[i], phase,
+#             fontsize=14, ha='center', va='center',
+#             bbox=dict(boxstyle="round,pad=0.3", fc="lightblue", ec="black"))
+
+# # Draw flows (curved arrows)
+# threshold = 0.05  # show transitions > 5%
+
+# for i in range(n):
+#     for j in range(n):
+#         prob = P_phase[i, j]
+#         if prob > threshold:
+#             start = (x_position + 0.1, y_positions[i])
+#             end   = (x_position + 0.6, y_positions[j])
+
+#             arrow = FancyArrowPatch(
+#                 start, end,
+#                 connectionstyle="arc3,rad=0.2",
+#                 arrowstyle='-|>',
+#                 mutation_scale=20,
+#                 lw=prob * 20,          # thickness proportional to probability
+#                 color='gray',
+#                 alpha=0.7
+#             )
+#             ax.add_patch(arrow)
+
+#             # Label the probability
+#             xm = (start[0] + end[0]) / 2
+#             ym = (start[1] + end[1]) / 2
+#             ax.text(xm, ym, f"{prob:.2f}", fontsize=10, ha='center')
+
+# # Clean up plot
+# ax.set_xlim(0, 1)
+# ax.set_ylim(0, 1)
+# ax.axis('off')
+# plt.title("Phase-Level MSM Sankey Diagram (Matplotlib)", fontsize=16)
+# plt.tight_layout()
+# plt.show()
+
+
+# ## Split 85/15
+
+# In[ ]:
+
+
+from sklearn.model_selection import train_test_split
+
+N = len(latents_sorted)
+indices = np.arange(N)
+
+train_idx, test_idx = train_test_split(
+    indices, test_size=0.15, random_state=0, shuffle=True
+)
+
+latents_train = latents_sorted[train_idx]
+latents_test  = latents_sorted[test_idx]
+
+xy_train = xy_sorted[train_idx]
+xy_test  = xy_sorted[test_idx]
+
+temps_train = temps_sorted[train_idx]
+temps_test  = temps_sorted[test_idx]
+
+ids_train = ids_sorted[train_idx]
+ids_test  = ids_sorted[test_idx]
+
+
+# In[ ]:
+
+
+pca = PCA(n_components=64)
+latents_train_pca = pca.fit_transform(latents_train)
+
+kmeans = KMeans(n_clusters=28, random_state=0)
+cluster_train = kmeans.fit_predict(latents_train)
+
+latents_test_pca = pca.transform(latents_test)
+cluster_test = kmeans.predict(latents_test)
+
+
+# In[ ]:
+
+
+phase_train = np.array([cluster_to_phase[c] for c in cluster_train])
+phase_test  = np.array([cluster_to_phase[c] for c in cluster_test])
+
+
+# In[ ]:
+
+
+unique_phases = sorted(set(phase_train))   # IMPORTANT: train only
+phase_to_id = {p: i for i, p in enumerate(unique_phases)}
+
+phase_id_train = np.array([phase_to_id[p] for p in phase_train])
+phase_id_test  = np.array([phase_to_id[p] for p in phase_test])
+
+
+# In[ ]:
+
+
+# Build grid for training set only
+T_unique_train = np.unique(temps_train)
+temp_to_idx_train = {T: i for i, T in enumerate(T_unique_train)}
+
+Ny = xy_train[:,0].max() + 1
+Nx = xy_train[:,1].max() + 1
+
+phase_id_grid_train = np.full((len(T_unique_train), Ny, Nx), -1, dtype=int)
+
+for i in range(len(latents_train)):
+    y, x = xy_train[i]
+    T = temps_train[i]
+    t_idx = temp_to_idx_train[T]
+    phase_id_grid_train[t_idx, y, x] = phase_id_train[i]
+
+
+# In[ ]:
+
+
+n_phases = len(unique_phases)
+n_temps_train = phase_id_grid_train.shape[0]
+
+C_phase_train = np.zeros((n_phases, n_phases), dtype=int)
+
+for t in range(n_temps_train - 1):
+    A = phase_id_grid_train[t].ravel()
+    B = phase_id_grid_train[t+1].ravel()
+    for a, b in zip(A, B):
+        if a >= 0 and b >= 0:
+            C_phase_train[a, b] += 1
+
+row_sums = C_phase_train.sum(axis=1, keepdims=True)
+P_phase_train = C_phase_train / np.maximum(row_sums, 1)
+
+
+# In[97]:
+
+
+i_all = 20  # or [3,6]
+
+current_phase_id = phase_id_all[i_all]
+current_phase_name = unique_phases[current_phase_id]
+
+next_phase_probs = P_phase_train[current_phase_id]
+
+print("Current phase:", current_phase_name)
+for p, prob in zip(unique_phases, next_phase_probs):
+    print(f"{current_phase_name} → {p}: {prob:.3f}")
+
+
+# In[ ]:
+
+
+patterns_test = all_originals_sorted[test_idx]
+
+plt.figure(figsize=(4,4))
+plt.imshow(patterns_test[i_test].squeeze(), cmap="inferno")
+plt.title(f"Test pattern {i_test}")
+plt.axis("off")
+plt.show()
+
+
+# In[ ]:
+
+
+
+
+
+# In[ ]:
+
+
+
+
+
+# In[ ]:
+
+
+
+
+
+# In[ ]:
+
+
+
+
+
+# In[ ]:
+
+
+
+
+
+# In[ ]:
+
+
+
+
+
+# In[ ]:
+
+
+
+
+
+# In[ ]:
+
+
+
+
+
+# In[ ]:
+
+
+n_clusters = cluster_labels.max() + 1
+n_temps = len(T_unique)
+
+# transition_matrix[t, i, j] = count of pixels going i -> j between T_t and T_{t+1}
+transition_matrix = np.zeros((n_temps-1, n_clusters, n_clusters), dtype=int)
+
+for t in range(n_temps - 1):
+    C_now = cluster_grid[t]      # (Ny, Nx)
+    C_next = cluster_grid[t+1]   # (Ny, Nx)
+
+    valid = (C_now >= 0) & (C_next >= 0)
+    from_c = C_now[valid].ravel()
+    to_c = C_next[valid].ravel()
+
+    for i_c, j_c in zip(from_c, to_c):
+        transition_matrix[t, i_c, j_c] += 1
+
+
+# In[ ]:
+
+
+t = 0  # between T_unique[0] and T_unique[1]
+plt.imshow(transition_matrix[t], cmap="viridis")
+plt.colorbar(label="Count")
+plt.xlabel("To cluster")
+plt.ylabel("From cluster")
+plt.title(f"Transitions: T={T_unique[t]} → T={T_unique[t+1]}")
+plt.show()
+
+
+# In[ ]:
+
+
+import numpy as np
+
+temps_u = np.unique(temps_sorted)
+clusters_u = np.unique(cluster_labels_2d)
+
+counts = np.zeros((len(temps_u), len(clusters_u)), dtype=int)
+
+for i, T in enumerate(temps_u):
+    mask_T = temps_sorted == T
+    labels_T = cluster_labels_2d[mask_T]
+    for j, c in enumerate(clusters_u):
+        counts[i, j] = np.sum(labels_T == c)
+
+# Pretty print
+col_width = 8
+header = "Temp".ljust(col_width) + "".join([f"C{c}".rjust(col_width) for c in clusters_u])
+print(header)
+
+for i, T in enumerate(temps_u):
+    row = f"{T}".ljust(col_width)
+    row += "".join([f"{counts[i,j]}".rjust(col_width) for j in range(len(clusters_u))])
+    print(row)
+
+
+# In[ ]:
+
+
+from sklearn.mixture import GaussianMixture
+
+gmm = GaussianMixture(
+    n_components=80,        # start large
+    covariance_type="diag", # full or diag
+    random_state=0
+)
+
+cluster_labels = gmm.fit_predict(latents_2d)
+cluster_probs = gmm.predict_proba(latents_2d)
+
+
+# In[ ]:
+
+
+plt.figure(figsize=(8, 6))
+plt.scatter(
+    latents_2d[:, 0],
+    latents_2d[:, 1],
+    c=cluster_labels,
+    cmap="tab20",
+    s=5
+)
+plt.title("GMM clusters after CAE")
+plt.xlabel("PCA dim 1")
+plt.ylabel("PCA dim 2")
+plt.colorbar(label="Cluster")
+plt.show()
+
+
+# In[ ]:
+
+
+# # microstate label per pattern
+# micro_labels = cluster_labels      # shape (N,) ###important: change to cluster_labels_2d for the kmeans version; omit _2d for GMM
+# n_micro = micro_labels.max() + 1
+
+
+# In[ ]:
+
+
+T_unique = np.unique(temps_sorted)
+temp_to_idx = {T: i for i, T in enumerate(T_unique)}
+
+Ny = xy_sorted[:,0].max() + 1
+Nx = xy_sorted[:,1].max() + 1
+
+cluster_grid = np.full((len(T_unique), Ny, Nx), -1, dtype=int)
+
+
+for i in range(len(micro_labels_kmeans)): ###change for kmeans or gmm
+    y, x = xy_sorted[i]
+    T = temps_sorted[i]
+    t_idx = temp_to_idx[T]
+    c = micro_labels_kmeans[i]      # GMM microstate label
+    cluster_grid[t_idx, y, x] = c
+
+
+
+# In[ ]:
+
+
+y0, x0 = 40, 1
+traj_micro = cluster_grid[:, y0, x0] 
+print(traj_micro)
+
+
+# In[ ]:
+
+
+all_trajectories_array = np.transpose(cluster_grid, (1, 2, 0))
+# print(all_trajectories_array)
+
+
+# In[ ]:
+
+
+# shape: (Ny, Nx, n_temps)
+traj_grid = all_trajectories_array
+
+trajectories = traj_grid.reshape(-1, traj_grid.shape[-1])  # (num_pixels, n_temps)
+
+
+# In[ ]:
+
+
+import numpy as np
+
+n_micro = micro_labels_kmeans.max() + 1
+T = np.zeros((n_micro, n_micro))
+
+for traj in trajectories:
+    for a, b in zip(traj[:-1], traj[1:]):
+        T[a, b] += 1
+
+# Row-normalize
+P = T / np.maximum(T.sum(axis=1, keepdims=True), 1)
+
+
+# In[ ]:
+
+
+import numpy as np
+from sklearn.cluster import KMeans
+
+def gpcca(P, n_macrostates=15):
+    # 1. Compute eigenvalues & eigenvectors
+    evals, evecs = np.linalg.eig(P.T)
+
+    # 2. Sort by eigenvalue magnitude (descending)
+    idx = np.argsort(-np.abs(evals))
+    evals = evals[idx]
+    evecs = evecs[:, idx]
+
+    # 3. Keep the first k slow modes
+    #    (exclude the stationary eigenvector if desired)
+    k = n_macrostates
+    slow_modes = np.real(evecs[:, :k])   # shape (n_micro, k)
+
+    # 4. Cluster microstates in slow-mode space
+    km = KMeans(n_clusters=n_macrostates, random_state=0)
+    macro_assignments = km.fit_predict(slow_modes)
+
+    return macro_assignments
+
+
+# In[ ]:
+
+
+macro_assignments = gpcca(P, n_macrostates=15)
+
+
+macro_labels = macro_assignments[micro_labels_kmeans]
+macro_grid = macro_assignments[cluster_grid]
+
+
+# In[ ]:
+
+
+import numpy as np
+
+n_macro = 15
+macro_to_indices = {m: [] for m in range(n_macro)}
+
+for i, m in enumerate(macro_labels):
+    macro_to_indices[m].append(i)
+
+samples_per_macro = {}
+
+for m in range(n_macro):
+    idxs = macro_to_indices[m]
+    idxs = np.array(idxs)
+
+    if len(idxs) == 0:
+        print(f"Macrostate {m} has no patterns.")
+        continue
+
+    # choose up to 10
+    k = min(10, len(idxs))
+    chosen = np.random.choice(idxs, size=k, replace=False)
+
+    samples_per_macro[m] = chosen
+
+patterns_per_macro = {
+    m: all_originals_sorted[samples_per_macro[m]]
+    for m in samples_per_macro
+}
+
+
+# In[ ]:
+
+
+import matplotlib.pyplot as plt
+
+for m in range(n_macro):
+    if m not in patterns_per_macro:
+        continue
+
+    pats = patterns_per_macro[m]
+    k = pats.shape[0]
+
+    cols = 5
+    rows = int(np.ceil(k / cols))
+
+    plt.figure(figsize=(12, 3 * rows))
+    plt.suptitle(f"Macrostate {m}: {k} sampled patterns", fontsize=16)
+
+    for i in range(k):
+        plt.subplot(rows, cols, i + 1)
+        plt.imshow(pats[i].squeeze(), cmap="plasma")   # ← FIX HERE
+        plt.title(f"#{i}", fontsize=10)
+        plt.axis("off")
+
+    plt.tight_layout()
+    plt.show()
+
+
+# In[ ]:
+
+
+macro_labels = macro_assignments[micro_labels_kmeans]   # shape (N,)
+
+import matplotlib.pyplot as plt
+
+plt.figure(figsize=(10, 8))
+
+plt.scatter(
+    latents_2d[:, 0],
+    latents_2d[:, 1],
+    c=macro_labels,
+    cmap="tab20",
+    s=5,
+    alpha=0.7
+)
+
+plt.title("15 GPCCA Macrostates in PCA Space", fontsize=16)
+plt.xlabel("PCA 1")
+plt.ylabel("PCA 2")
+plt.colorbar(label="Macrostate")
+plt.tight_layout()
+plt.show()
+
+
+# In[ ]:
+
+
+
+
+
+# In[ ]:
+
+
+
+
+
+# In[ ]:
+
+
+cluster_to_physical = {
+    0: "amorphous",
+    1: "crystalline",
+    2: "polycrystalline",
+    3: "mixed",
+    4: "recrystallized",
+    5: "crystalline",
+    6: "recrystallized",
+    7: "amorphous",
+    8: "crystalline",
+    9: "twinned"
+}
+
+
+# In[ ]:
+
+
+physical_grid = np.vectorize(cluster_to_physical.get)(all_trajectories_array)
+y0, x0 = 13, 1
+physical_traj = physical_grid[y0, x0] 
+print(physical_traj)
+
+
+# In[ ]:
+
+
+# 1. Define a fixed, explicit phase order
+phases = [
+    "amorphous",
+    "crystalline",
+    "polycrystalline",
+    "mixed",
+    "recrystallized",
+    "twinned"
+]
+
+# 2. Convert cluster numbers → physical labels
+physical_grid = np.vectorize(cluster_to_physical.get)(all_trajectories_array)
+Ny, Nx, n_temps = physical_grid.shape
+
+# 3. Count patterns in each phase at each temperature
+phase_counts = {phase: np.zeros(n_temps, dtype=int) for phase in phases}
+
+for t in range(n_temps):
+    slice_t = physical_grid[:, :, t].ravel()
+    for phase in phases:
+        phase_counts[phase][t] = np.sum(slice_t == phase)
+
+# 4. Pretty-print the table with aligned columns
+col_width = 18  # adjust for spacing
+
+header = "Temp".ljust(8) + "".join(phase.ljust(col_width) for phase in phases)
+print(header)
+print("-" * len(header))
+
+for t in range(n_temps):
+    row = str(t).ljust(8)
+    for phase in phases:
+        row += str(phase_counts[phase][t]).ljust(col_width)
+    print(row)
+
+
+# In[ ]:
+
+
+import matplotlib.pyplot as plt
+
+counts_matrix = np.vstack([phase_counts[p] for p in phases])
+
+plt.figure(figsize=(10,5))
+plt.imshow(counts_matrix, aspect='auto', cmap='viridis')
+plt.yticks(range(len(phases)), phases)
+plt.xlabel("Temperature index")
+plt.title("Number of patterns in each phase vs temperature")
+plt.colorbar(label="Count")
+plt.show()
+
+
+# In[ ]:
+
+
+phases = [
+    "amorphous",
+    "crystalline",
+    "polycrystalline",
+    "mixed",
+    "recrystallized",
+    "twinned"
+]
+phase_to_idx = {p: i for i, p in enumerate(phases)}
+
+physical_grid = np.vectorize(cluster_to_physical.get)(all_trajectories_array)
+phase_grid = np.vectorize(phase_to_idx.get)(physical_grid)
+
+
+n_phases = len(phases)
+n_temps = phase_grid.shape[2]
+
+C_phase = np.zeros((n_phases, n_phases), dtype=int)
+
+for t in range(n_temps - 1):
+    A = phase_grid[:, :, t].ravel()
+    B = phase_grid[:, :, t+1].ravel()
+    for a, b in zip(A, B):
+        C_phase[a, b] += 1
+
+
+row_sums = C_phase.sum(axis=1, keepdims=True)
+P_phase = C_phase / np.maximum(row_sums, 1)
+
+
+col_width = 18
+header = "From/To".ljust(col_width) + "".join(p.ljust(col_width) for p in phases)
+print(header)
+print("-" * len(header))
+
+for i, p in enumerate(phases):
+    row = p.ljust(col_width)
+    for j in range(n_phases):
+        row += f"{P_phase[i,j]:.3f}".ljust(col_width)
+    print(row)
+
+
+# In[ ]:
+
+
+
+
+
+# In[ ]:
+
+
+
+
+
+# In[ ]:
+
+
+
+
+
+# In[ ]:
+
+
+
+
+
+# In[ ]:
+
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+rng = np.random.default_rng(0)   # reproducible randomness
+n_show = 5                       # number of patterns per cluster
+clusters = np.unique(cluster_labels)
+
+for k in clusters:
+    # indices of all points in this cluster
+    idx = np.where(cluster_labels == k)[0]
+
+    print(f"Cluster {k}: {len(idx)} patterns")
+
+    # choose up to n_show random examples
+    sel = rng.choice(idx, size=min(n_show, len(idx)), replace=False)
+
+    # plot them
+    fig, axes = plt.subplots(1, len(sel), figsize=(3*len(sel), 3))
+    if len(sel) == 1:
+        axes = [axes]
+
+    for ax, i in zip(axes, sel):
+        img = all_originals_sorted[i, 0]   # (H, W)
+        ax.imshow(img, cmap="inferno")
+        ax.axis("off")
+
+    fig.suptitle(f"GMM Cluster {k} (n={len(idx)})")
+    plt.tight_layout()
+    plt.show()
+
+
+# In[ ]:
+
+
+cluster_grid = np.full((len(T_unique), Ny, Nx), -1, int)
+
+T_unique = np.unique(temps_sorted)
+n_temps = len(T_unique)
+Ny, Nx = cluster_grid.shape[1:]
+
+for i in range(len(latents_2d)):
+    y, x = xy_sorted[i]
+    T = temps_sorted[i]
+    t_idx = temp_to_idx[T]
+    c = micro_labels[i]          # <-- use GMM labels here
+    cluster_grid[t_idx, y, x] = c
+
+trajectories = []
+for y in range(Ny):
+    for x in range(Nx):
+        traj = cluster_grid[:, y, x]
+        if np.any(traj >= 0):
+            trajectories.append(traj.astype(np.int32))
+
+
+# In[ ]:
+
+
+plt.figure(figsize=(8,6))
+plt.scatter(
+    latents_2d[:,0],
+    latents_2d[:,1],
+    c=temps_sorted,
+    cmap="plasma",
+    s=5
+)
+plt.colorbar(label="Temperature index")
+plt.xlabel("PCA dim 1")
+plt.ylabel("PCA dim 2")
+plt.title("PCA embedding colored by temperature")
+plt.show()
+
+
+# In[ ]:
+
+
+# with h5py.File(h5_path, "r") as f:
+#     dp = f[temp_keys[0]]["patterns"]
+#     print("dp.shape:", dp.shape)
+
+
+# In[ ]:
+
+
+target_cluster = 5
+n_temps = len(T_unique)
+Ny, Nx = cluster_grid.shape[1:]
+
+first_appearance = np.full((Ny, Nx), fill_value=-1, dtype=int)
+
+for t in range(n_temps):
+    C = cluster_grid[t]  # shape (Ny, Nx)
+    mask = (C == target_cluster) & (first_appearance == -1)
+    first_appearance[mask] = t
+
+
+# In[ ]:
+
+
+plt.figure(figsize=(6,5))
+im = plt.imshow(first_appearance, cmap="plasma", origin="lower")
+plt.colorbar(im, label=f"First temp index of cluster {target_cluster}")
+plt.title(f"First appearance of cluster {target_cluster}")
+plt.axis("off")
+plt.show()
+
+
+# In[ ]:
+
+
+# t0 = 2
+# t1 = 3
+# C0 = cluster_grid[t0]
+# C1 = cluster_grid[t1]
+
+# changed = (C0 != C1) & (C0 >= 0) & (C1 >= 0)
+
+# plt.figure(figsize=(6,5))
+# plt.imshow(C1, cmap="tab20", origin="lower")
+# plt.contour(changed, levels=[0.5], colors="red", linewidths=1.0)
+# plt.title(f"Cluster map at T={T_unique[t1]} with change front from T={T_unique[t0]}")
+# plt.axis("off")
+# plt.show()
+
+
+# In[ ]:
+
+
+
+
+
+# ## MSM
+
+# In[ ]:
+
+
+# data = np.load("cluster_trajectories.npz", allow_pickle=True)
+# traj_array = data["trajectories"]   # 1D object array
+
+# trajectories = [np.asarray(traj, dtype=int) for traj in traj_array]
+
+
+# In[ ]:
+
+
+n_states = max(traj.max() for traj in trajectories) + 1
+print("number of states:", n_states)
+
+lag = 1
+
+C = np.zeros((n_states, n_states), dtype=float)
+
+for traj in trajectories:
+    for t in range(len(traj) - lag):
+        i = traj[t]          # from-state
+        j = traj[t + lag]    # to-state
+        C[i, j] += 1
+
+# ### only active states
+# active = np.array([0, 2, 4, 5, 6])
+# mapping = -np.ones(n_states, dtype=int)
+# for new, old in enumerate(active):
+#     mapping[old] = new
+
+# trajectories_active = [mapping[traj] for traj in trajectories]
+
+### zeroing
+row_sums = C.sum(axis=1, keepdims=True)
+zero_rows = (row_sums == 0).flatten()
+
+C[zero_rows, :] = 1e-12
+row_sums = C.sum(axis=1, keepdims=True)
+
+
+P = C / row_sums # row stochaistic normalization like pyemma
+P[np.isnan(P)] = 0  
+
+pi = np.ones(n_states) / n_states # left eigenvector
+for _ in range(10000):
+    pi = pi @ P
+
+print("stationary distribution:", pi)
+print("sum:", pi.sum())
+
+
+# In[ ]:
+
+
+eigvals, eigvecs = np.linalg.eig(P.T)
+idx = np.argsort(-eigvals.real)
+eigvals = eigvals[idx]
+V = np.real(eigvecs[:, :k])
+
+plt.figure(figsize=(6,4))
+plt.bar(range(10), eigvals[:10].real)
+plt.title("Top 10 eigenvalues")
+plt.xlabel("index")
+plt.ylabel("eigenvalue")
+plt.show()
+
+
+
+# In[ ]:
+
+
+kmeans = KMeans(n_clusters=n_meta, random_state=0).fit(V)
+centers = kmeans.cluster_centers_
+
+dists = np.linalg.norm(V[:, None, :] - centers[None, :, :], axis=2)
+chi = 1.0 / (dists + 1e-12)
+chi = chi / chi.sum(axis=1, keepdims=True)
+
+meta_labels = np.argmax(chi, axis=1)
+
+Chi = chi
+A = Chi.T @ P @ Chi
+B = Chi.T @ Chi
+P_macro = A @ np.linalg.inv(B)
+P_macro = P_macro / P_macro.sum(axis=1, keepdims=True)
+
+
+# In[ ]:
+
+
+pattern_meta = meta_labels[micro_labels]   # shape (N,)
+
+import numpy as np
+
+N_meta = 5
+H, W = all_originals_sorted.shape[2], all_originals_sorted.shape[3]
+
+rep_mean = np.zeros((N_meta, H, W))
+rep_median = np.zeros((N_meta, H, W))
+
+for m in range(N_meta):
+    idx = np.where(pattern_meta == m)[0]
+    if len(idx) == 0:
+        continue
+
+    patterns_m = all_originals_sorted[idx, 0]   # (n_m, H, W)
+
+    rep_mean[m] = patterns_m.mean(axis=0)
+    rep_median[m] = np.median(patterns_m, axis=0)
+
+
+# In[ ]:
+
+
+import matplotlib.pyplot as plt
+
+fig, axes = plt.subplots(2, N_meta, figsize=(3*N_meta, 6))
+
+for m in range(N_meta):
+    axes[0, m].imshow(rep_mean[m], cmap="inferno")
+    axes[0, m].set_title(f"Macrostate {m} – Mean")
+    axes[0, m].axis("off")
+
+    axes[1, m].imshow(rep_median[m], cmap="inferno")
+    axes[1, m].set_title(f"Macrostate {m} – Median")
+    axes[1, m].axis("off")
+
+plt.tight_layout()
+plt.show()
+
+
+# In[ ]:
+
+
+rng = np.random.default_rng(0)
+n_show = 5
+
+for m in range(N_meta):
+    idx = np.where(pattern_meta == m)[0]
+    if len(idx) == 0:
+        continue
+
+    sel = rng.choice(idx, size=min(n_show, len(idx)), replace=False)
+
+    fig, axes = plt.subplots(1, len(sel), figsize=(3*len(sel), 3))
+    for ax, i in zip(axes, sel):
+        ax.imshow(all_originals_sorted[i, 0], cmap="inferno")
+        ax.axis("off")
+    fig.suptitle(f"Macrostate {m}: sample patterns")
+    plt.show()
+
+
+# In[ ]:
+
+
+def macro_trajectory_for_pixel(y, x, cluster_grid, meta_labels):
+    traj_micro = cluster_grid[:, y, x]          # shape (n_temps,)
+    traj_macro = np.array([meta_labels[m] if m >= 0 else -1 for m in traj_micro])
+    return traj_micro, traj_macro
+
+
+# In[ ]:
+
+
+y0, x0 = 40, 1
+traj_micro, traj_macro = macro_trajectory_for_pixel(y0, x0, cluster_grid, meta_labels)
+
+print("Microstate trajectory:", traj_micro)
+print("Macrostate trajectory:", traj_macro)
+
+
+# In[ ]:
+
+
+#pathway predictions
+start_macro = traj_macro[0]   # or any temperature index you choose
+
+p1 = P_macro[start_macro]
+
+def k_step(P, s, k):
+    return np.linalg.matrix_power(P, k)[s]
+
+p10 = k_step(P_macro, start_macro, 5)
+
+
+# In[ ]:
+
+
+def most_likely_path(P, start, steps):
+    path = [start]
+    s = start
+    for _ in range(steps):
+        s = np.argmax(P[s])
+        path.append(s)
+    return path
+
+path_ml = most_likely_path(P_macro, start_macro, 5)
+print("Most likely macrostate path:", path_ml)
+
+
+# In[ ]:
+
+
+def patterns_for_pixel(y, x, xy_sorted, temps_sorted, all_originals_sorted):
+    mask = (xy_sorted[:, 0] == y) & (xy_sorted[:, 1] == x)
+    idxs = np.where(mask)[0]
+
+    # sort by temperature
+    order = np.argsort(temps_sorted[idxs])
+    idxs = idxs[order]
+
+    patterns_px = all_originals_sorted[idxs, 0]   # (n_temps, H, W)
+    temps_px = temps_sorted[idxs]
+
+    return temps_px, patterns_px
+
+def macro_trajectory_for_pixel(y, x, cluster_grid, meta_labels):
+    traj_micro = cluster_grid[:, y, x]
+    traj_macro = np.array([meta_labels[m] if m >= 0 else -1 for m in traj_micro])
+    return traj_macro
+
+
+# In[ ]:
+
+
+y0, x0 = 20, 40
+temps_px, patterns_px = patterns_for_pixel(y0, x0, xy_sorted, temps_sorted, all_originals_sorted)
+traj_macro = macro_trajectory_for_pixel(y0, x0, cluster_grid, meta_labels)
+
+
+
+# In[ ]:
+
+
+import matplotlib.pyplot as plt
+
+def show_pixel_trajectory(temps_px, patterns_px, traj_macro):
+    n = len(temps_px)
+    fig, axes = plt.subplots(1, n, figsize=(3*n, 3))
+
+    if n == 1:
+        axes = [axes]
+
+    for ax, T, img, m in zip(axes, temps_px, patterns_px, traj_macro):
+        ax.imshow(img, cmap="inferno")
+        ax.set_title(f"T={T}\nState={m}")
+        ax.axis("off")
+
+    plt.tight_layout()
+    plt.show()
+
+
+show_pixel_trajectory(temps_px, patterns_px, traj_macro)
+
+
+
+
+# In[ ]:
+
+
+n_states = max(traj.max() for traj in trajectories) + 1
+C = np.zeros((n_states, n_states), float)
+for traj in trajectories:
+    for t in range(len(traj) - 1):
+        i = traj[t]
+        j = traj[t+1]
+        C[i, j] += 1
+
+row_sums = C.sum(axis=1, keepdims=True)
+
+zero_rows = (row_sums == 0).flatten()
+C[zero_rows, :] = 1e-12
+
+row_sums = C.sum(axis=1, keepdims=True)
+P = C / row_sums
+
+
+# In[ ]:
+
+
+k = 5   # number of metastable states you want
+eigvals, eigvecs = np.linalg.eig(P.T)
+
+# sort by |eigval| descending
+idx = np.argsort(-eigvals.real)
+eigvals = eigvals[idx]
+eigvecs = eigvecs[:, idx]
+
+V = np.real(eigvecs[:, :k])   # shape (n_states, k)
+
+
+# In[ ]:
+
+
+from sklearn.cluster import KMeans
+
+n_meta = 5
+meta_labels = KMeans(n_clusters=n_meta, random_state=0).fit_predict(V)
+# meta_labels[i] = metastable state index (0..9) for microstate i
+
+metastable_sets = [np.where(meta_labels == m)[0] for m in range(n_meta)]
+
+
+# In[ ]:
+
+
+n_meta = len(metastable_sets)
+P_meta = np.zeros((n_meta, n_meta), float)
+
+for a, A in enumerate(metastable_sets):
+    denom = pi[A].sum()
+    if denom == 0:
+        continue
+    for b, B in enumerate(metastable_sets):
+        num = 0.0
+        for i in A:
+            num += pi[i] * P[i, B].sum()
+        P_meta[a, b] = num / denom
+
+# normalize rows (numerical safety)
+P_meta = P_meta / P_meta.sum(axis=1, keepdims=True)
+
+
+
+
+
+

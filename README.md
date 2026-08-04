@@ -15,4 +15,12 @@ The current workflow includes:
 
  **This repository is an active work in progress.** The code is functional and reflects the current analysis workflow, but it is still being cleaned up, documented, and expanded. Interfaces and functionality may change as new methods are added and existing ones are refined.
 
+ This project requires the following Python packages:
+- h5py
+- numpy
+- scipy
+- matplotlib
+- torch
+- scikit-learn
+
 Contributions, suggestions, and feedback are always welcome.
